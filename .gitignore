@@ -1,0 +1,44 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Personal scripts (not part of the public package)
+/chimera_deep.py
+/scan_all.py
+/scan_one.py
+/scan_results.json
+/xray.py
+/diff.py
+/health.py
+/surgery.py
+/ablate.py
+/neurons.py
+/attention.py
+/logit_lens.py
+
+# Environment
+.env
+.venv/
+env/
+venv/
