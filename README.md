@@ -176,7 +176,7 @@ pip install model-clinic[dev]
 ## Development
 
 ```bash
-git clone https://github.com/connorlab/model-clinic.git
+git clone https://github.com/spartan8806/model-clinic.git
 cd model-clinic
 pip install -e ".[dev,all]"
 pytest tests/ -v
