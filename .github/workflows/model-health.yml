@@ -15,16 +15,24 @@ on:
         description: 'Path to model checkpoint'
         required: true
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   health-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Install model-clinic
+        run: pip install model-clinic
+
       - name: Run model health check
-        uses: spartan8806/model-clinic@v0.3.0
-        with:
-          model-path: ${{ github.event.inputs.model-path || 'checkpoints/model.pt' }}
-          threshold: 60
+        run: |
+          MODEL_PATH="${{ github.event.inputs.model-path || 'checkpoints/model.pt' }}"
+          echo "Checking: $MODEL_PATH"
+          model-clinic check "$MODEL_PATH" --threshold 60

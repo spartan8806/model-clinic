@@ -4,7 +4,9 @@ on:
   push:
     tags:
       - "v*"
-      - "test-v*"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test:
@@ -46,38 +48,10 @@ jobs:
           name: dist
           path: dist/
 
-  publish-testpypi:
-    name: Publish to TestPyPI
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/test-v')
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/p/model-clinic
-    steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Download distributions
-        uses: actions/download-artifact@v5
-        with:
-          name: dist
-          path: dist/
-
-      - name: Publish to TestPyPI
-        run: |
-          pip install twine
-          twine upload --repository-url https://test.pypi.org/legacy/ dist/*
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN }}
-
   publish-pypi:
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') && !startsWith(github.ref, 'refs/tags/test-v')
     environment:
       name: pypi
       url: https://pypi.org/p/model-clinic
