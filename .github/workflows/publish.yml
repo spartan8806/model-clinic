@@ -55,6 +55,10 @@ jobs:
       name: testpypi
       url: https://test.pypi.org/p/model-clinic
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Download distributions
         uses: actions/download-artifact@v5
         with:
@@ -62,10 +66,12 @@ jobs:
           path: dist/
 
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          password: ${{ secrets.TEST_PYPI_TOKEN }}
+        run: |
+          pip install twine
+          twine upload --repository-url https://test.pypi.org/legacy/ dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN }}
 
   publish-pypi:
     name: Publish to PyPI
@@ -76,6 +82,10 @@ jobs:
       name: pypi
       url: https://pypi.org/p/model-clinic
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Download distributions
         uses: actions/download-artifact@v5
         with:
@@ -83,6 +93,9 @@ jobs:
           path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.name }}
+        run: |
+          pip install twine
+          twine upload dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.name }}
