@@ -23,6 +23,9 @@ htmlcov/
 Thumbs.db
 .DS_Store
 
+# Internal roadmap (not public)
+/V3_ROADMAP.md
+
 # Personal scripts (not part of the public package)
 /chimera_deep.py
 /scan_all.py
@@ -36,6 +39,16 @@ Thumbs.db
 /neurons.py
 /attention.py
 /logit_lens.py
+
+# Generated reports & scripts (session artifacts)
+*.html
+gen_*.py
+load_safetensors_safe.py
+validate_vs_weightwatcher.py
+
+# Model checkpoints (too large for git)
+*.pt
+*.manifest.json
 
 # Environment
 .env

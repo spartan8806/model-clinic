@@ -22,13 +22,18 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 
-from model_clinic._types import Finding, Prescription, TreatmentResult, ExamReport
+from model_clinic._types import (
+    Finding, Prescription, TreatmentResult, ExamReport,
+    ExamResult, PipelineResult,
+)
 from model_clinic._loader import load_state_dict, load_model, build_meta, save_state_dict
 from model_clinic._eval import (
     eval_coherence, eval_perplexity, eval_logit_entropy, eval_diversity,
-    DEFAULT_PROMPTS,
+    DEFAULT_PROMPTS, EXAMPLE_RUNTIME_PROMPTS,
 )
 from model_clinic._utils import safe_str, to_float
+from model_clinic._health_score import compute_health_score, print_health_score
+from model_clinic._references import format_references
 
 
 # ── Thresholds & constants ────────────────────────────────────────────────
@@ -39,7 +44,7 @@ GATE_OPEN_THRESHOLD = 0.99         # sigmoid above this = stuck open
 EXPLODING_NORM_THRESHOLD = 10.0    # Per-element norm above this = exploding
 VANISHING_NORM_THRESHOLD = 1e-6    # Per-element norm below this = vanishing
 KURTOSIS_THRESHOLD = 50            # Kurtosis above this = heavy tails
-NORM_DRIFT_THRESHOLD = 0.5         # |mean - 1.0| above this = drifted
+NORM_DRIFT_THRESHOLD = 1.5         # |mean - 1.0| above this = drifted (pretraining shifts norms naturally)
 SATURATION_THRESHOLD = 0.3         # Fraction near max above this = saturated
 SIMILARITY_THRESHOLD = 0.999       # Cosine sim above this = duplicate rows
 MAX_TENSOR_ELEMENTS = 50_000_000   # Skip tensors larger than this for expensive ops
@@ -91,11 +96,21 @@ class ConditionRegistry:
                 "make_rx": prescriber,
             }
 
-    def detect_all(self, state_dict, context=None):
+    def detect_all(self, state_dict, context=None, verbose=False):
         """Run all detectors on a state dict."""
         context = context or {}
         findings = []
+        # Pre-populate all tensor names so detectors can inspect the full key set
+        context.setdefault("_all_tensor_names", set(state_dict.keys()))
+        # Deduplicate detectors (same function may be registered under multiple names)
+        seen_detectors = set()
         for condition, detector in self._detectors.items():
+            detector_id = id(detector)
+            if detector_id in seen_detectors:
+                continue
+            seen_detectors.add(detector_id)
+            if verbose:
+                print(f"  Checking {condition}...")
             for name, tensor in state_dict.items():
                 if not isinstance(tensor, torch.Tensor):
                     continue
@@ -308,6 +323,511 @@ def detect_attention_imbalance(name, tensor, ctx):
     return []
 
 
+def detect_weight_corruption(name, tensor, ctx):
+    """Detect truncated or corrupted tensors."""
+    if tensor.numel() <= 100:
+        return []
+    # Skip bias and norm tensors — they can legitimately be uniform
+    name_lower = name.lower()
+    if any(kw in name_lower for kw in ["bias", "norm.weight", "layernorm", "rmsnorm"]):
+        return []
+    findings = []
+    t = tensor.float()
+
+    # All-zero weight matrices
+    if tensor.dim() >= 2 and t.abs().max().item() == 0:
+        findings.append(Finding(
+            "weight_corruption", "ERROR", name,
+            {"reason": "all_zeros", "shape": list(tensor.shape)},
+        ))
+        return findings
+
+    # All-same-value tensors (constant)
+    if t.min().item() == t.max().item():
+        findings.append(Finding(
+            "weight_corruption", "WARN", name,
+            {"reason": "constant_value", "value": t.min().item(),
+             "shape": list(tensor.shape)},
+        ))
+        return findings
+
+    # >50% identical values (quantization artifact or corruption)
+    if tensor.numel() <= MAX_TENSOR_ELEMENTS:
+        flat = t.flatten()
+        # Use mode to find the most common value
+        mode_val = flat.mode().values.item()
+        same_count = (flat == mode_val).sum().item()
+        frac = same_count / flat.numel()
+        if frac > 0.5:
+            findings.append(Finding(
+                "weight_corruption", "WARN", name,
+                {"reason": "majority_same_value", "value": mode_val,
+                 "fraction": frac, "shape": list(tensor.shape)},
+            ))
+
+    return findings
+
+
+def detect_head_redundancy(name, tensor, ctx):
+    """Collect Q projection weights for post-scan head redundancy check."""
+    if "q_proj" not in name or tensor.dim() < 2:
+        return []
+    q_weights = ctx.setdefault("_q_proj_weights", {})
+    # Extract layer key
+    layer_key = name.replace(".q_proj.weight", "").replace(".q_proj.bias", "")
+    q_weights[layer_key] = tensor.detach().float()
+    return []
+
+
+def detect_positional_issues(name, tensor, ctx):
+    """Detect broken positional encodings."""
+    name_lower = name.lower()
+    if not any(kw in name_lower for kw in ["position", "rotary", "rope"]):
+        return []
+    findings = []
+    t = tensor.float()
+
+    # Check for NaN/Inf
+    if torch.isnan(t).any() or torch.isinf(t).any():
+        findings.append(Finding(
+            "positional_encoding_issues", "ERROR", name,
+            {"reason": "nan_or_inf",
+             "nan_count": int(torch.isnan(t).sum().item()),
+             "inf_count": int(torch.isinf(t).sum().item())},
+        ))
+        return findings
+
+    # All zeros (broken)
+    if t.abs().max().item() == 0:
+        findings.append(Finding(
+            "positional_encoding_issues", "ERROR", name,
+            {"reason": "all_zeros", "shape": list(tensor.shape)},
+        ))
+        return findings
+
+    # All same value
+    if t.min().item() == t.max().item():
+        findings.append(Finding(
+            "positional_encoding_issues", "WARN", name,
+            {"reason": "constant_value", "value": t.min().item()},
+        ))
+        return findings
+
+    # If 2D, rows should be distinct (each position should be different)
+    if tensor.dim() == 2 and tensor.shape[0] >= 4:
+        n = min(tensor.shape[0], ROW_SAMPLE_SIZE)
+        sample = t[:n]
+        norms = sample.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        normed = sample / norms
+        sims = normed @ normed.T
+        triu_mask = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+        high_sim = int((sims[triu_mask] > SIMILARITY_THRESHOLD).sum().item())
+        if high_sim > 0:
+            findings.append(Finding(
+                "positional_encoding_issues", "WARN", name,
+                {"reason": "duplicate_positions", "duplicate_pairs": high_sim,
+                 "shape": list(tensor.shape)},
+            ))
+
+    return findings
+
+
+def detect_token_collapse(name, tensor, ctx):
+    """Check if lm_head/output projection has near-identical rows (tokens that always get same score)."""
+    if tensor.dim() != 2:
+        return []
+    name_lower = name.lower()
+    if "lm_head" not in name_lower and "output" not in name_lower:
+        return []
+    n_rows = tensor.shape[0]
+    if n_rows < 4:
+        return []
+    # Sample up to 500 rows
+    sample_n = min(n_rows, 500)
+    if sample_n < n_rows:
+        indices = torch.randperm(n_rows)[:sample_n]
+        sample = tensor[indices].float()
+    else:
+        sample = tensor.float()
+    # Compute pairwise cosine similarity
+    norms = sample.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    normed = sample / norms
+    sims = normed @ normed.T
+    triu_mask = torch.triu(torch.ones(sample_n, sample_n, dtype=torch.bool), diagonal=1)
+    high_sim_count = int((sims[triu_mask] > 0.99).sum().item())
+    total_pairs = int(triu_mask.sum().item())
+    del sample, normed, sims, triu_mask
+    if total_pairs > 0 and high_sim_count / total_pairs > 0.10:
+        return [Finding(
+            "token_collapse", "WARN", name,
+            {"collapsed_pair_fraction": high_sim_count / total_pairs,
+             "collapsed_pairs": high_sim_count,
+             "total_pairs": total_pairs,
+             "sampled_rows": sample_n},
+        )]
+    return []
+
+
+def detect_gradient_noise(name, tensor, ctx):
+    """Estimate gradient noise from weight distribution characteristics.
+
+    High condition number (max/min singular value ratio) predicts gradient
+    instability during further training.
+    """
+    if tensor.dim() != 2 or tensor.numel() <= 1000:
+        return []
+    # Embedding/token tables have inherently high condition numbers (rare tokens
+    # have near-zero vectors) — this is expected, not a defect.
+    name_lower = name.lower()
+    if any(kw in name_lower for kw in ["embed_tokens", "token_embedding", "wte", "word_embedding"]):
+        return []
+    t = tensor.float()
+    m, n = t.shape
+    # Sample a submatrix if large
+    max_dim = 256
+    if m > max_dim:
+        row_idx = torch.randperm(m)[:max_dim]
+        t = t[row_idx]
+    if t.shape[1] > max_dim:
+        col_idx = torch.randperm(n)[:max_dim]
+        t = t[:, col_idx]
+    try:
+        sv = torch.linalg.svdvals(t)
+        sv_pos = sv[sv > 1e-10]
+        if len(sv_pos) < 2:
+            return []
+        condition_number = (sv_pos[0] / sv_pos[-1]).item()
+        # Condition numbers up to ~50K are common in healthy pretrained models.
+        # Only flag at 50K+ (WARN) or 1M+ (ERROR) for real instability.
+        if condition_number > 50_000:
+            severity = "WARN" if condition_number < 1_000_000 else "ERROR"
+            return [Finding(
+                "gradient_noise", severity, name,
+                {"condition_number": condition_number,
+                 "max_sv": sv_pos[0].item(),
+                 "min_sv": sv_pos[-1].item(),
+                 "shape": list(tensor.shape)},
+            )]
+    except Exception:
+        return []
+    return []
+
+
+def _collect_layer_norms(name, tensor, ctx):
+    """Collector: record per-element norm for each weight tensor, keyed by layer."""
+    import re
+    if tensor.dim() < 2:
+        return []
+    # Extract a layer index from the name (e.g. "layers.3.mlp.weight" -> 3)
+    match = re.search(r'layers?[._](\d+)', name)
+    if not match:
+        return []
+    layer_idx = int(match.group(1))
+    layer_norms = ctx.setdefault("_layer_weight_norms", {})
+    norms_list = layer_norms.setdefault(layer_idx, [])
+    per_elem = tensor.float().norm().item() / (tensor.numel() ** 0.5)
+    norms_list.append(per_elem)
+    return []
+
+
+def detect_moe_router_collapse(name, tensor, ctx):
+    """Detect router/gate collapse in MoE models."""
+    name_lower = name.lower()
+    if tensor.dim() != 2:
+        return []
+    # Must contain "router" or "gate" — but exclude common non-MoE gates
+    # like gate_proj (Qwen/LLaMA MLP gating), gate_up_proj, etc.
+    is_router = "router" in name_lower
+    is_gate = "gate" in name_lower and not any(
+        x in name_lower for x in ["gate_proj", "gate_up", "gate_down"]
+    )
+    if not is_router and not is_gate:
+        return []
+    # Must be a routing matrix (2D), not a scalar gate
+    if tensor.shape[0] < 2 or tensor.shape[1] < 2:
+        return []
+    t = tensor.float()
+    # Compute softmax per row to get routing probabilities
+    probs = F.softmax(t, dim=-1)
+    # Compute per-row entropy
+    log_probs = torch.log(probs.clamp(min=1e-10))
+    entropy = -(probs * log_probs).sum(dim=-1)
+    avg_entropy = entropy.mean().item()
+    # Maximum possible entropy for uniform distribution
+    max_entropy = torch.log(torch.tensor(float(t.shape[-1]))).item()
+    # Normalized entropy (0 = collapsed, 1 = uniform)
+    norm_entropy = avg_entropy / max_entropy if max_entropy > 0 else 0
+    findings = []
+    if norm_entropy < 0.3:
+        findings.append(Finding(
+            "moe_router_collapse", "WARN", name,
+            {"avg_entropy": avg_entropy, "max_entropy": max_entropy,
+             "normalized_entropy": norm_entropy, "reason": "collapsed",
+             "shape": list(tensor.shape)},
+        ))
+    elif norm_entropy > 0.95:
+        findings.append(Finding(
+            "moe_router_collapse", "INFO", name,
+            {"avg_entropy": avg_entropy, "max_entropy": max_entropy,
+             "normalized_entropy": norm_entropy, "reason": "near_uniform",
+             "shape": list(tensor.shape)},
+        ))
+    return findings
+
+
+def detect_lora_merge_artifacts(name, tensor, ctx):
+    """Detect artifacts from LoRA weight merging.
+
+    After LoRA merge, effective rank may be much lower than matrix dimensions,
+    indicating the merge dominated the base weights.
+
+    Only runs if the checkpoint shows evidence of LoRA (adapter keys present),
+    since pretrained attention matrices are inherently low-rank.
+    """
+    if tensor.dim() != 2:
+        return []
+    # Skip check if model has no LoRA evidence — pretrained base models have
+    # naturally low-rank attention matrices; that is NOT a defect.
+    has_lora = ctx.get("_has_lora_keys")
+    if has_lora is None:
+        # First time: scan all keys collected so far
+        all_keys = ctx.get("_all_tensor_names", set())
+        has_lora = any(
+            any(kw in k.lower() for kw in ["lora_a", "lora_b", "adapter", "lora_up", "lora_down"])
+            for k in all_keys
+        )
+        ctx["_has_lora_keys"] = has_lora
+    if not has_lora:
+        return []
+    name_lower = name.lower()
+    if not any(kw in name_lower for kw in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+        return []
+    m, n = tensor.shape
+    if min(m, n) < 4:
+        return []
+    t = tensor.float()
+    # Sample a 256x256 submatrix for SVD
+    max_dim = 256
+    if m > max_dim:
+        row_idx = torch.randperm(m)[:max_dim]
+        t = t[row_idx]
+    if t.shape[1] > max_dim:
+        col_idx = torch.randperm(t.shape[1])[:max_dim]
+        t = t[:, col_idx]
+    try:
+        sv = torch.linalg.svdvals(t)
+        sv_pos = sv[sv > 1e-10]
+        if len(sv_pos) < 2:
+            return []
+        # Effective rank: nuclear norm / spectral norm
+        nuclear_norm = sv_pos.sum().item()
+        spectral_norm = sv_pos[0].item()
+        effective_rank = nuclear_norm / spectral_norm if spectral_norm > 0 else 0
+        min_dim = min(t.shape[0], t.shape[1])
+        rank_ratio = effective_rank / min_dim if min_dim > 0 else 0
+        if rank_ratio < 0.1:
+            return [Finding(
+                "lora_merge_artifacts", "WARN", name,
+                {"effective_rank": effective_rank,
+                 "matrix_min_dim": min_dim,
+                 "rank_ratio": rank_ratio,
+                 "top_sv": sv_pos[:5].tolist(),
+                 "shape": list(tensor.shape)},
+            )]
+    except Exception:
+        return []
+    return []
+
+
+def detect_quantization_degradation(name, tensor, ctx):
+    """Detect quality loss from quantization (GPTQ, AWQ, INT8, FP8).
+
+    Signs of quantization degradation include very low unique-value counts
+    relative to tensor size, uniform spacing between values (grid pattern),
+    and large blocks of identical values.
+
+    Note: bf16 has ~65K representable values, so large bf16 tensors naturally
+    have low unique ratios. We only flag when unique count is extremely low
+    AND the spacing is grid-like (uniform), which indicates actual quantization.
+    """
+    if tensor.dim() < 2 or tensor.numel() < 1000:
+        return []
+    # Skip bf16/fp16 tensors for ratio-only checks — they have inherently
+    # limited precision. Only flag if grid-quantized pattern detected.
+    is_low_precision = tensor.dtype in (torch.bfloat16, torch.float16)
+    t = tensor.float().flatten()
+    # Sample up to 100K elements
+    sample_size = min(t.numel(), 100_000)
+    if sample_size < t.numel():
+        indices = torch.randperm(t.numel())[:sample_size]
+        sample = t[indices]
+    else:
+        sample = t
+    unique_vals = torch.unique(sample)
+    n_unique = len(unique_vals)
+    unique_ratio = n_unique / sample_size
+    findings = []
+
+    # For bf16/fp16: only flag if unique count is extremely low (< 256 unique
+    # values = likely INT8 or aggressive quantization) AND grid pattern detected
+    # For fp32: use the original thresholds
+    if is_low_precision:
+        threshold = 256  # absolute count, not ratio
+        if n_unique >= threshold:
+            return []
+    elif unique_ratio >= 0.05:
+        return []
+
+    if not is_low_precision and unique_ratio < 0.05:
+        severity = "WARN" if unique_ratio < 0.01 else "INFO"
+    elif is_low_precision:
+        severity = "WARN" if n_unique < 64 else "INFO"
+    else:
+        severity = "INFO"
+
+    details = {
+        "unique_values": n_unique,
+        "sample_size": sample_size,
+        "unique_ratio": unique_ratio,
+        "shape": list(tensor.shape),
+    }
+    # Check for grid-quantized values (uniform spacing)
+    if n_unique >= 2:
+        sorted_unique = unique_vals.sort().values
+        spacings = sorted_unique[1:] - sorted_unique[:-1]
+        if spacings.numel() > 1:
+            mean_spacing = spacings.mean().item()
+            std_spacing = spacings.std().item()
+            if mean_spacing > 0:
+                cv = std_spacing / mean_spacing
+                details["spacing_cv"] = cv
+                details["grid_quantized"] = cv < 0.1
+    findings.append(Finding(
+        "quantization_degradation", severity, name, details,
+    ))
+    return findings
+
+
+def _collect_model_aging(name, tensor, ctx):
+    """Collector: gather embedding and output weights for model aging detection."""
+    if tensor.dim() != 2:
+        return []
+    name_lower = name.lower()
+    if "embed" in name_lower:
+        embeds = ctx.setdefault("_aging_embed_weights", {})
+        embeds[name] = tensor.detach().float()
+    elif "lm_head" in name_lower or "output" in name_lower:
+        outputs = ctx.setdefault("_aging_output_weights", {})
+        outputs[name] = tensor.detach().float()
+    return []
+
+
+def post_detect_model_aging(ctx):
+    """Detect signs of catastrophic forgetting or model aging.
+
+    Checks for:
+    - Collapsed embedding representations (low effective rank)
+    - Inverted layer norm gradient (early layers >> later layers)
+    - Near-identical rows in output projection (token merging from forgetting)
+    """
+    findings = []
+
+    # Check embedding effective rank
+    embed_weights = ctx.get("_aging_embed_weights", {})
+    for ename, etensor in embed_weights.items():
+        m, n = etensor.shape
+        if min(m, n) < 4:
+            continue
+        try:
+            # Sample submatrix for SVD efficiency
+            max_dim = 256
+            t = etensor
+            if m > max_dim:
+                t = t[torch.randperm(m)[:max_dim]]
+            if t.shape[1] > max_dim:
+                t = t[:, torch.randperm(t.shape[1])[:max_dim]]
+            sv = torch.linalg.svdvals(t)
+            sv_pos = sv[sv > 1e-10]
+            if len(sv_pos) < 2:
+                continue
+            nuclear_norm = sv_pos.sum().item()
+            spectral_norm = sv_pos[0].item()
+            effective_rank = nuclear_norm / spectral_norm if spectral_norm > 0 else 0
+            min_dim = min(t.shape[0], t.shape[1])
+            rank_ratio = effective_rank / min_dim if min_dim > 0 else 0
+            if rank_ratio < 0.05:
+                findings.append(Finding(
+                    "model_aging", "WARN", ename,
+                    {"reason": "collapsed_embeddings",
+                     "effective_rank": effective_rank,
+                     "matrix_min_dim": min_dim,
+                     "rank_ratio": rank_ratio},
+                ))
+        except Exception:
+            continue
+
+    # Check inverted layer norm gradient (early >> later)
+    layer_norms = ctx.get("_layer_weight_norms", {})
+    if len(layer_norms) >= 4:
+        sorted_layers = sorted(layer_norms.keys())
+        n_layers = len(sorted_layers)
+        quarter = max(1, n_layers // 4)
+        early_layers = sorted_layers[:quarter]
+        late_layers = sorted_layers[-quarter:]
+        early_mean = sum(
+            sum(layer_norms[l]) / len(layer_norms[l])
+            for l in early_layers
+        ) / len(early_layers)
+        late_mean = sum(
+            sum(layer_norms[l]) / len(layer_norms[l])
+            for l in late_layers
+        ) / len(late_layers)
+        if late_mean > 1e-10:
+            norm_ratio = early_mean / late_mean
+            if norm_ratio > 5.0:
+                findings.append(Finding(
+                    "model_aging", "WARN", f"layers.{early_layers[0]}->{late_layers[-1]}",
+                    {"reason": "inverted_norm_gradient",
+                     "early_mean_norm": early_mean,
+                     "late_mean_norm": late_mean,
+                     "ratio": norm_ratio},
+                ))
+
+    # Check output projection for near-identical rows (token merging)
+    output_weights = ctx.get("_aging_output_weights", {})
+    for oname, otensor in output_weights.items():
+        n_rows = otensor.shape[0]
+        if n_rows < 4:
+            continue
+        sample_n = min(n_rows, 500)
+        if sample_n < n_rows:
+            indices = torch.randperm(n_rows)[:sample_n]
+            sample = otensor[indices]
+        else:
+            sample = otensor
+        norms = sample.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        normed = sample / norms
+        sims = normed @ normed.T
+        triu_mask = torch.triu(
+            torch.ones(sample_n, sample_n, dtype=torch.bool), diagonal=1
+        )
+        high_sim_count = int((sims[triu_mask] > 0.99).sum().item())
+        total_pairs = int(triu_mask.sum().item())
+        del sample, normed, sims, triu_mask
+        if total_pairs > 0:
+            merged_fraction = high_sim_count / total_pairs
+            if merged_fraction > 0.05:
+                findings.append(Finding(
+                    "model_aging", "WARN", oname,
+                    {"reason": "token_merging",
+                     "merged_pair_fraction": merged_fraction,
+                     "merged_pairs": high_sim_count,
+                     "sampled_rows": sample_n},
+                ))
+
+    return findings
+
+
 # ── Post-scan detectors (run after all params scanned) ─────────────────────
 
 def post_detect_dtype_mismatch(ctx):
@@ -346,6 +866,291 @@ def post_detect_attention_imbalance(ctx):
     return findings
 
 
+def post_detect_head_redundancy(ctx):
+    """Compare Q projection weights across heads within each layer."""
+    q_weights = ctx.get("_q_proj_weights", {})
+    findings = []
+    for layer_key, q_tensor in q_weights.items():
+        if q_tensor.dim() != 2:
+            continue
+        # Infer number of heads from hidden_size in meta
+        meta = ctx.get("meta", {})
+        hidden_size = 0
+        if isinstance(meta, dict):
+            hidden_size = meta.get("hidden_size", 0)
+        else:
+            hidden_size = getattr(meta, "hidden_size", 0)
+        if hidden_size <= 0:
+            hidden_size = q_tensor.shape[1]
+        # Q proj shape is (num_heads * head_dim, hidden_size)
+        total_out = q_tensor.shape[0]
+        if hidden_size > 0 and total_out > hidden_size:
+            head_dim = hidden_size  # rough estimate
+            n_heads = total_out // head_dim
+        else:
+            # Try common head dims
+            for hd in [64, 128, 96, 80, 48, 32]:
+                if total_out % hd == 0:
+                    n_heads = total_out // hd
+                    head_dim = hd
+                    break
+            else:
+                continue
+        if n_heads < 2:
+            continue
+        # Extract per-head weight blocks and compare
+        head_dim = total_out // n_heads
+        head_vecs = []
+        for h in range(n_heads):
+            block = q_tensor[h * head_dim:(h + 1) * head_dim].flatten()
+            norm = block.norm().clamp(min=1e-8)
+            head_vecs.append(block / norm)
+        redundant_pairs = []
+        for i in range(n_heads):
+            for j in range(i + 1, n_heads):
+                sim = (head_vecs[i] * head_vecs[j]).sum().item()
+                if sim > 0.99:
+                    redundant_pairs.append((i, j, sim))
+        if redundant_pairs:
+            findings.append(Finding(
+                "head_redundancy", "WARN", layer_key,
+                {"redundant_pairs": [(i, j, round(s, 4)) for i, j, s in redundant_pairs[:10]],
+                 "num_heads": n_heads, "head_dim": head_dim},
+            ))
+    return findings
+
+
+def post_detect_representation_drift(ctx):
+    """Compare per-element weight norms of consecutive layers.
+
+    If adjacent layers have dramatically different norm profiles (ratio > 10x),
+    this indicates representation drift — the model's internal representations
+    shift abruptly between layers.
+    """
+    layer_norms = ctx.get("_layer_weight_norms", {})
+    if len(layer_norms) < 2:
+        return []
+    # Compute mean per-element norm for each layer
+    layer_means = {}
+    for layer_idx, norms_list in sorted(layer_norms.items()):
+        if norms_list:
+            layer_means[layer_idx] = sum(norms_list) / len(norms_list)
+    sorted_layers = sorted(layer_means.keys())
+    findings = []
+    for i in range(len(sorted_layers) - 1):
+        l_curr = sorted_layers[i]
+        l_next = sorted_layers[i + 1]
+        norm_curr = layer_means[l_curr]
+        norm_next = layer_means[l_next]
+        if norm_curr < 1e-10 and norm_next < 1e-10:
+            continue
+        ratio = max(norm_curr, norm_next) / max(min(norm_curr, norm_next), 1e-10)
+        if ratio > 10:
+            findings.append(Finding(
+                "representation_drift", "WARN",
+                f"layers.{l_curr}->layers.{l_next}",
+                {"layer_a": l_curr, "layer_b": l_next,
+                 "norm_a": norm_curr, "norm_b": norm_next,
+                 "ratio": ratio},
+            ))
+    return findings
+
+
+# ── Causal tracing detectors ───────────────────────────────────────────────
+
+def _collect_causal_norms(name, tensor, ctx):
+    """Collector: accumulate per-element norms keyed by layer type for causal outlier detection."""
+    import re
+    if tensor.dim() < 2:
+        return []
+    # Extract a layer type suffix (e.g. "attention.q_proj.weight", "mlp.down_proj.weight")
+    match = re.search(r'layers?[._]\d+[._](.*)', name)
+    if not match:
+        return []
+    layer_type = match.group(1)
+    per_elem = tensor.float().norm().item() / (tensor.numel() ** 0.5)
+    causal_norms = ctx.setdefault("_causal_type_norms", {})
+    entries = causal_norms.setdefault(layer_type, [])
+    entries.append({"name": name, "per_elem_norm": per_elem})
+    return []
+
+
+def post_detect_causal_outlier(ctx):
+    """Identify layers whose per-element norm is a causal outlier among same-type layers.
+
+    A layer is flagged if its norm is >2x (WARN) or >3x (ERROR) the mean norm
+    of all layers of the same type, OR if its condition number exceeds 1M.
+    These layers are statistically most likely to cause generation collapse.
+    """
+    causal_norms = ctx.get("_causal_type_norms", {})
+    findings = []
+    for layer_type, entries in causal_norms.items():
+        if len(entries) < 2:
+            continue
+        norms = [e["per_elem_norm"] for e in entries]
+        mean_norm = sum(norms) / len(norms)
+        if mean_norm < 1e-10:
+            continue
+        for entry in entries:
+            ratio = entry["per_elem_norm"] / mean_norm
+            if ratio > 3.0:
+                severity = "ERROR"
+            elif ratio > 2.0:
+                severity = "WARN"
+            else:
+                continue
+            findings.append(Finding(
+                condition="causal_outlier",
+                severity=severity,
+                param_name=entry["name"],
+                details={
+                    "per_elem_norm": entry["per_elem_norm"],
+                    "type_mean_norm": mean_norm,
+                    "ratio": ratio,
+                    "layer_type": layer_type,
+                },
+            ))
+    return findings
+
+
+def _collect_layer_isolation(name, tensor, ctx):
+    """Collector: gather flattened weight statistics per layer index for isolation detection."""
+    import re
+    if tensor.dim() < 2:
+        return []
+    match = re.search(r'layers?[._](\d+)', name)
+    if not match:
+        return []
+    layer_idx = int(match.group(1))
+    # Extract sub-component type (e.g. "attention.q_proj.weight")
+    type_match = re.search(r'layers?[._]\d+[._](.*)', name)
+    if not type_match:
+        return []
+    component = type_match.group(1)
+    isolation_data = ctx.setdefault("_layer_isolation_data", {})
+    by_component = isolation_data.setdefault(component, {})
+    # Store mean and std of the weight tensor for this layer
+    t = tensor.float()
+    by_component[layer_idx] = {
+        "name": name,
+        "mean": t.mean().item(),
+        "std": t.std().item(),
+        "per_elem_norm": t.norm().item() / (t.numel() ** 0.5),
+    }
+    return []
+
+
+def post_detect_layer_isolation(ctx):
+    """Detect when a layer's weight space is isolated from its neighbors.
+
+    For each component type (e.g. attention.q_proj.weight), compares
+    consecutive layer statistics. If the norm ratio between adjacent layers
+    of the same type exceeds 5x, flags as isolated.
+    """
+    isolation_data = ctx.get("_layer_isolation_data", {})
+    findings = []
+    for component, layer_data in isolation_data.items():
+        if len(layer_data) < 2:
+            continue
+        sorted_indices = sorted(layer_data.keys())
+        for i in range(len(sorted_indices) - 1):
+            idx_a = sorted_indices[i]
+            idx_b = sorted_indices[i + 1]
+            data_a = layer_data[idx_a]
+            data_b = layer_data[idx_b]
+            norm_a = data_a["per_elem_norm"]
+            norm_b = data_b["per_elem_norm"]
+            if norm_a < 1e-10 and norm_b < 1e-10:
+                continue
+            ratio = max(norm_a, norm_b) / max(min(norm_a, norm_b), 1e-10)
+            if ratio > 5.0:
+                # Flag the layer with the higher norm as isolated
+                if norm_a > norm_b:
+                    flagged_name = data_a["name"]
+                else:
+                    flagged_name = data_b["name"]
+                findings.append(Finding(
+                    condition="layer_isolation",
+                    severity="WARN",
+                    param_name=flagged_name,
+                    details={
+                        "layer_a": idx_a,
+                        "layer_b": idx_b,
+                        "norm_a": norm_a,
+                        "norm_b": norm_b,
+                        "ratio": ratio,
+                        "component": component,
+                    },
+                ))
+    return findings
+
+
+def causal_rank(findings, state_dict):
+    """Rank tensors by causal responsibility for downstream failures.
+
+    Given a list of findings and the state dict, produces a sorted ranking
+    of which tensors are most likely causing generation collapse or other
+    failures. Higher score = more likely culprit.
+
+    Args:
+        findings: list of Finding objects from diagnose()
+        state_dict: the model state dict
+
+    Returns:
+        list of dicts: [{tensor_name, causal_score, reason}, ...] sorted by score descending
+    """
+    # Severity weights for scoring
+    severity_score = {"ERROR": 10, "WARN": 5, "INFO": 1}
+    # Condition weights — conditions more indicative of causal responsibility
+    condition_weight = {
+        "causal_outlier": 3.0,
+        "layer_isolation": 2.5,
+        "exploding_norm": 2.0,
+        "nan_inf": 5.0,
+        "dead_neurons": 1.5,
+        "representation_drift": 2.0,
+        "weight_corruption": 3.0,
+        "heavy_tails": 1.0,
+        "norm_drift": 1.0,
+        "gradient_noise": 1.5,
+        "vanishing_norm": 1.0,
+        "saturated_weights": 0.5,
+    }
+
+    # Accumulate scores per tensor
+    tensor_scores = {}
+    tensor_reasons = {}
+    for f in findings:
+        name = f.param_name
+        base = severity_score.get(f.severity, 1)
+        weight = condition_weight.get(f.condition, 1.0)
+        score = base * weight
+        tensor_scores[name] = tensor_scores.get(name, 0) + score
+        reasons = tensor_reasons.setdefault(name, [])
+        reasons.append(f.condition)
+
+    # Build result list
+    results = []
+    for name, score in tensor_scores.items():
+        reasons = tensor_reasons[name]
+        # Deduplicate reasons while preserving order
+        seen = set()
+        unique_reasons = []
+        for r in reasons:
+            if r not in seen:
+                seen.add(r)
+                unique_reasons.append(r)
+        results.append({
+            "tensor_name": name,
+            "causal_score": score,
+            "reason": ", ".join(unique_reasons),
+        })
+
+    # Sort by score descending
+    results.sort(key=lambda x: x["causal_score"], reverse=True)
+    return results
+
+
 # ── Register all detectors ─────────────────────────────────────────────────
 
 def _rx_dead_neurons(f):
@@ -354,6 +1159,12 @@ def _rx_dead_neurons(f):
         description=f"Reinit {f.details['dead_count']} dead {f.details['dim']} in {f.param_name}",
         risk="low", finding=f, action="reinit_dead",
         params={"indices": f.details["dead_indices"], "dim": f.details["dim"]},
+        explanation=(
+            "Dead neurons contribute nothing to the model's computation. "
+            "Reinitializing them with small random values gives them a chance "
+            "to learn useful features during further training. Risk is low "
+            "because the neurons were already inactive."
+        ),
     )
 
 def _rx_nudge_gate(f):
@@ -362,6 +1173,12 @@ def _rx_nudge_gate(f):
         description=f"Nudge {f.param_name} from {f.details['sigmoid']:.4f} toward 4.7%",
         risk="medium", finding=f, action="set_gate",
         params={"value": -3.0},
+        explanation=(
+            "This gate is stuck closed (sigmoid near 0), blocking the signal "
+            "path entirely. Nudging it to sigmoid ~4.7% allows a small signal "
+            "through without overwhelming the network. Risk is medium because "
+            "it changes the model's behavior."
+        ),
     )
 
 def _rx_pull_gate(f):
@@ -370,6 +1187,12 @@ def _rx_pull_gate(f):
         description=f"Pull {f.param_name} from {f.details['sigmoid']:.4f} back to 95%",
         risk="medium", finding=f, action="set_gate",
         params={"value": 3.0},
+        explanation=(
+            "This gate is stuck fully open (sigmoid near 1), passing the "
+            "full signal unconditionally. Pulling it back to ~95% restores "
+            "gradient flow so the gate can learn to modulate. Risk is medium "
+            "because it changes the model's behavior."
+        ),
     )
 
 def _rx_scale_norm(f):
@@ -378,6 +1201,11 @@ def _rx_scale_norm(f):
         description=f"Scale {f.param_name} norm from {f.details['per_elem_norm']:.2f} toward 1.0",
         risk="medium", finding=f, action="scale_norm",
         params={"target_per_elem": 1.0},
+        explanation=(
+            "Exploding weight norms amplify activations through the network, "
+            "leading to numerical instability and poor generation quality. "
+            "Scaling to healthy range reduces this amplification."
+        ),
     )
 
 def _rx_reinit_vanishing(f):
@@ -385,6 +1213,11 @@ def _rx_reinit_vanishing(f):
         name="reinit_vanishing",
         description=f"Reinit {f.param_name} (norm {f.details['per_elem_norm']:.2e})",
         risk="low", finding=f, action="reinit_full",
+        explanation=(
+            "Near-zero parameters have effectively no contribution and produce "
+            "near-zero gradients, preventing learning. Reinitializing gives "
+            "them a fresh start."
+        ),
     )
 
 def _rx_clamp_tails(f):
@@ -393,6 +1226,12 @@ def _rx_clamp_tails(f):
         description=f"Clamp {f.param_name} outliers (kurtosis={f.details['kurtosis']:.0f})",
         risk="medium", finding=f, action="clamp_outliers",
         params={"sigma": CLAMP_SIGMA},
+        explanation=(
+            "Heavy-tailed weight distributions (high kurtosis) contain extreme "
+            "outliers that dominate computation for certain inputs. Clamping "
+            "beyond 4 standard deviations removes these outliers while "
+            "preserving the bulk of the distribution."
+        ),
     )
 
 def _rx_reset_norm(f):
@@ -400,6 +1239,11 @@ def _rx_reset_norm(f):
         name="reset_norm",
         description=f"Reset {f.param_name} mean from {f.details['mean']:.3f} toward 1.0",
         risk="low", finding=f, action="reset_norm_weights",
+        explanation=(
+            "LayerNorm weights should be close to 1.0. Drift indicates the "
+            "normalization layer is scaling features unevenly, which can cause "
+            "training instability. Resetting to 1.0 restores uniform scaling."
+        ),
     )
 
 def _rx_desaturate(f):
@@ -408,6 +1252,11 @@ def _rx_desaturate(f):
         description=f"Desaturate {f.param_name} ({f.details['near_max_pct']:.0%} at boundary)",
         risk="medium", finding=f, action="desaturate",
         params={"factor": 0.8},
+        explanation=(
+            "Saturated weights are pinned near their maximum values, reducing "
+            "the effective dynamic range of the layer. Scaling down increases "
+            "gradient flow and allows finer-grained adjustments during training."
+        ),
     )
 
 def _rx_fix_nan(f):
@@ -415,6 +1264,12 @@ def _rx_fix_nan(f):
         name="fix_nan_inf",
         description=f"Zero out {f.details['nan_count']} NaN + {f.details['inf_count']} Inf in {f.param_name}",
         risk="high", finding=f, action="fix_nan_inf",
+        explanation=(
+            "NaN/Inf values cause cascading failures in any computation they "
+            "touch. Zeroing them out prevents propagation but the underlying "
+            "cause (overflow, division by zero) may need investigation. Risk "
+            "is high because zeroing may change model behavior."
+        ),
     )
 
 def _rx_perturb_identical(f):
@@ -422,6 +1277,22 @@ def _rx_perturb_identical(f):
         name="perturb_identical_rows",
         description=f"Add noise to {f.details['duplicate_pairs']} duplicate row pairs in {f.param_name}",
         risk="low", finding=f, action="perturb_identical",
+        explanation=(
+            "Identical rows mean redundant computation — the model wastes "
+            "capacity on duplicate features. Adding small noise breaks the "
+            "symmetry so each row can specialize during further training."
+        ),
+    )
+
+def _rx_advisory(f):
+    return Prescription(
+        name=f"advisory_{f.condition}",
+        description=f"Advisory: {f.condition} detected in {f.param_name}",
+        risk="low", finding=f, action="advisory",
+        explanation=(
+            "This is an advisory finding — no automatic fix is available. "
+            "Manual investigation is recommended."
+        ),
     )
 
 # Register everything
@@ -449,18 +1320,81 @@ REGISTRY.register("dtype_mismatch", detect_dtype_mismatch, risk="low",
                    description="Mixed dtypes across parameters")
 REGISTRY.register("attention_imbalance", detect_attention_imbalance,
                    risk="medium", description="Q/K/V projection norm imbalance")
+REGISTRY.register("weight_corruption", detect_weight_corruption, risk="info",
+                   description="Truncated or corrupted weight tensors")
+REGISTRY.register("head_redundancy", detect_head_redundancy, risk="info",
+                   description="Redundant attention heads")
+REGISTRY.register("positional_encoding_issues", detect_positional_issues, risk="info",
+                   description="Broken or degenerate positional encodings")
+REGISTRY.register("token_collapse", detect_token_collapse, _rx_advisory, "low",
+                   "Near-identical output token embeddings")
+REGISTRY.register("gradient_noise", detect_gradient_noise, _rx_advisory, "low",
+                   "High condition number predicts gradient instability")
+REGISTRY.register("_collect_layer_norms", _collect_layer_norms, risk="low",
+                   description="Collector for representation drift detection")
+REGISTRY.register("moe_router_collapse", detect_moe_router_collapse, _rx_advisory, "low",
+                   "MoE router/gate entropy collapse or uniformity")
+REGISTRY.register("lora_merge_artifacts", detect_lora_merge_artifacts, _rx_advisory, "low",
+                   "Low effective rank suggesting LoRA merge artifacts")
+REGISTRY.register("quantization_degradation", detect_quantization_degradation, _rx_advisory, "low",
+                   "Quality loss from quantization (low unique-value count, grid patterns)")
+REGISTRY.register("_collect_model_aging", _collect_model_aging, risk="low",
+                   description="Collector for model aging detection")
+REGISTRY.register("_collect_causal_norms", _collect_causal_norms, risk="low",
+                   description="Collector for causal outlier detection")
+REGISTRY.register("_collect_layer_isolation", _collect_layer_isolation, risk="low",
+                   description="Collector for layer isolation detection")
 
 
 # ── Diagnosis engine ───────────────────────────────────────────────────────
 
-def diagnose(state_dict, meta=None):
-    """Run all diagnostic checks. Returns list of Findings."""
+def diagnose(state_dict, meta=None, verbose=False, plugins=True):
+    """Run all diagnostic checks. Returns list of Findings.
+
+    Parameters
+    ----------
+    state_dict : dict
+        Model state dict (parameter name -> tensor).
+    meta : dict, optional
+        Model metadata.
+    verbose : bool
+        Print progress messages.
+    plugins : bool
+        If True (default), auto-load installed plugins before diagnosis.
+        Set to False to skip plugin loading.
+    """
+    if plugins:
+        from model_clinic._plugins import load_plugins, plugins_loaded
+        if not plugins_loaded():
+            loaded = load_plugins(REGISTRY)
+            if loaded and verbose:
+                print(f"  Loaded plugins: {', '.join(loaded)}")
+
     context = {"meta": meta or {}}
-    findings = REGISTRY.detect_all(state_dict, context)
+    findings = REGISTRY.detect_all(state_dict, context, verbose=verbose)
 
     # Post-scan detectors
+    if verbose:
+        print("  Checking dtype_mismatch...")
     findings.extend(post_detect_dtype_mismatch(context))
+    if verbose:
+        print("  Checking attention_imbalance...")
     findings.extend(post_detect_attention_imbalance(context))
+    if verbose:
+        print("  Checking head_redundancy...")
+    findings.extend(post_detect_head_redundancy(context))
+    if verbose:
+        print("  Checking representation_drift...")
+    findings.extend(post_detect_representation_drift(context))
+    if verbose:
+        print("  Checking model_aging...")
+    findings.extend(post_detect_model_aging(context))
+    if verbose:
+        print("  Checking causal_outlier...")
+    findings.extend(post_detect_causal_outlier(context))
+    if verbose:
+        print("  Checking layer_isolation...")
+    findings.extend(post_detect_layer_isolation(context))
 
     return findings
 
@@ -468,6 +1402,127 @@ def diagnose(state_dict, meta=None):
 def prescribe(findings, conservative=False):
     """Map findings to prescriptions."""
     return REGISTRY.prescribe(findings, conservative=conservative)
+
+
+# ── Batch processing ──────────────────────────────────────────────────────
+
+def _examine_one(path, hf=False):
+    """Examine a single model, returning an ExamResult (never raises)."""
+    try:
+        sd, raw_meta = load_state_dict(path, hf=hf)
+        meta = build_meta(sd, source=raw_meta.get("source", "checkpoint"))
+        findings = diagnose(sd, meta)
+        prescriptions = prescribe(findings)
+        health = compute_health_score(findings)
+        return ExamResult(
+            path=path,
+            findings=findings,
+            prescriptions=prescriptions,
+            health_score=health,
+            meta=meta,
+        )
+    except Exception as e:
+        return ExamResult(path=path, error=str(e))
+
+
+def examine_batch(paths, hf=False, parallel=False):
+    """Examine multiple models at once.
+
+    Args:
+        paths: list of checkpoint paths or HF model names
+        hf: treat all as HuggingFace models
+        parallel: if True, use ThreadPoolExecutor (I/O bound loading)
+
+    Returns:
+        list of ExamResult, one per model
+    """
+    if parallel:
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(len(paths), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(lambda p: _examine_one(p, hf=hf), paths))
+        return results
+    return [_examine_one(p, hf=hf) for p in paths]
+
+
+# ── Treatment pipelines ─────────────────────────────────────────────────────
+
+class TreatmentPipeline:
+    """A reusable sequence of treatment steps."""
+
+    def __init__(self, steps):
+        """
+        Args:
+            steps: list of (condition_name, params_override) tuples
+        """
+        self.steps = steps
+
+    def run(self, state_dict, conservative=False, dry_run=False):
+        """Run the pipeline on a state dict.
+
+        Returns:
+            PipelineResult with findings, prescriptions, treatments,
+            and health scores before and after.
+        """
+        # Diagnose
+        all_findings = diagnose(state_dict)
+        health_before = compute_health_score(all_findings)
+
+        # Filter to requested conditions
+        step_conditions = {name for name, _ in self.steps}
+        relevant = [f for f in all_findings if f.condition in step_conditions]
+
+        # Build prescriptions
+        all_rx = prescribe(relevant, conservative=conservative)
+
+        # Build override map: condition -> params
+        overrides = {name: params for name, params in self.steps}
+
+        # Apply overrides to prescription params
+        for rx in all_rx:
+            extra = overrides.get(rx.finding.condition, {})
+            if extra:
+                rx.params.update(extra)
+
+        # Apply treatments in order
+        treatments = []
+        for rx in all_rx:
+            result = apply_treatment(state_dict, rx, dry_run=dry_run)
+            treatments.append(result)
+
+        # Re-diagnose for after score
+        after_findings = diagnose(state_dict)
+        health_after = compute_health_score(after_findings)
+
+        return PipelineResult(
+            findings=relevant,
+            prescriptions=all_rx,
+            treatments=treatments,
+            health_before=health_before,
+            health_after=health_after,
+        )
+
+    def describe(self):
+        """Print what the pipeline will do."""
+        print("Treatment Pipeline:")
+        for i, (condition, params) in enumerate(self.steps, 1):
+            if params:
+                print(f"  {i}. {condition} (overrides: {params})")
+            else:
+                print(f"  {i}. {condition}")
+
+
+def create_pipeline(steps):
+    """Create a treatment pipeline.
+
+    Args:
+        steps: list of (condition_name, params_override) tuples
+               e.g. [("dead_neurons", {"scale": 0.01}), ("norm_drift", {})]
+
+    Returns:
+        TreatmentPipeline object
+    """
+    return TreatmentPipeline(steps)
 
 
 # ── Treatment engine ───────────────────────────────────────────────────────
@@ -595,6 +1650,9 @@ def _do_treatment(tensor, rx):
                     tensor[row] += torch.randn_like(tensor[row]) * noise_scale
                 return True, f"Perturbed {min(len(dups), 100)} near-duplicate rows"
         return False, "Not a 2D tensor"
+
+    elif action == "advisory":
+        return True, "Advisory only — no automatic fix"
 
     return False, f"Unknown action: {action}"
 
@@ -846,12 +1904,22 @@ def _print_finding_detail(f):
         "activation_collapse": lambda: f"    {f.param_name}: std={d['std']:.2e}, {d['zero_frac']:.0%} zeros",
         "residual_explosion": lambda: f"    norm ratio first->last: {d['ratio']:.0f}x",
         "residual_collapse": lambda: f"    norm ratio first->last: {d['ratio']:.4f}x (shrinking)",
+        "weight_corruption": lambda: f"    {f.param_name}: {d['reason']} (shape={d.get('shape', '?')})",
+        "head_redundancy": lambda: f"    {f.param_name}: {len(d['redundant_pairs'])} redundant head pair(s) across {d['num_heads']} heads",
+        "positional_encoding_issues": lambda: f"    {f.param_name}: {d['reason']}",
+        "token_collapse": lambda: f"    {f.param_name}: {d['collapsed_pair_fraction']:.1%} of sampled row pairs have cosine sim > 0.99",
+        "gradient_noise": lambda: f"    {f.param_name}: condition number={d['condition_number']:.0f} (max_sv={d['max_sv']:.4f}, min_sv={d['min_sv']:.2e})",
+        "representation_drift": lambda: f"    {f.param_name}: norm ratio={d['ratio']:.1f}x ({d['norm_a']:.4f} vs {d['norm_b']:.4f})",
+        "moe_router_collapse": lambda: f"    {f.param_name}: {d['reason']} (norm_entropy={d['normalized_entropy']:.3f})",
+        "lora_merge_artifacts": lambda: f"    {f.param_name}: effective_rank={d['effective_rank']:.1f}/{d['matrix_min_dim']} ({d['rank_ratio']:.3f})",
+        "quantization_degradation": lambda: f"    {f.param_name}: {d['unique_values']} unique values in {d['sample_size']} samples ({d['unique_ratio']:.3%}){' [grid]' if d.get('grid_quantized') else ''}",
+        "model_aging": lambda: f"    {f.param_name}: {d['reason']}" + (f" (rank_ratio={d['rank_ratio']:.3f})" if 'rank_ratio' in d else f" (ratio={d.get('ratio', d.get('merged_pair_fraction', '?'))})"),
     }
     fmt = formatters.get(f.condition, lambda: f"    {f.param_name}: {d}")
     print(fmt())
 
 
-def print_exam(findings, prescriptions):
+def print_exam(findings, prescriptions, explain=False):
     """Print full exam report."""
     errors = sum(1 for f in findings if f.severity == "ERROR")
     warns = sum(1 for f in findings if f.severity == "WARN")
@@ -879,6 +1947,11 @@ def print_exam(findings, prescriptions):
                 print(f"    {k}: [{len(v)} indices]")
             else:
                 print(f"    {k}: {v}")
+        if explain and rx.explanation:
+            print(f"    WHY: {rx.explanation}")
+            refs = format_references(rx.finding.condition)
+            if refs:
+                print(refs)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -895,6 +1968,8 @@ def build_parser(subparsers=None):
         parser_treat.add_argument("--dry-run", action="store_true", help="Show what would change")
         parser_treat.add_argument("--conservative", action="store_true", help="Only low-risk fixes")
         parser_treat.add_argument("--no-rollback", action="store_true", help="Don't auto-rollback on regression")
+        parser_treat.add_argument("--manifest", type=str, default=None,
+                                  help="Save treatment manifest (auto-saved with --save)")
         parser.set_defaults(func=run_exam)
         parser_treat.set_defaults(func=run_treat)
         return parser
@@ -908,6 +1983,8 @@ def build_parser(subparsers=None):
         parser.add_argument("--dry-run", action="store_true", help="Show what would change")
         parser.add_argument("--conservative", action="store_true", help="Only low-risk fixes")
         parser.add_argument("--no-rollback", action="store_true", help="Don't auto-rollback")
+        parser.add_argument("--manifest", type=str, default=None,
+                            help="Save treatment manifest (auto-saved with --save)")
         return parser
 
 
@@ -919,12 +1996,21 @@ def _add_common_args(parser):
     parser.add_argument("--export", type=str, default=None, help="Export report to JSON")
     parser.add_argument("--json", action="store_true", help="Output as JSON only")
     parser.add_argument("--quiet", "-q", action="store_true", help="Minimal output")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show detailed progress (which detector/treatment is running)")
+    parser.add_argument("--explain", action="store_true", help="Show explanations for prescriptions")
+    parser.add_argument("--example-prompts", action="store_true",
+                        help="Use diverse example prompts for runtime testing instead of defaults")
+    parser.add_argument("--profile", type=str, default=None,
+                        choices=["llm", "vit", "diffusion", "auto"],
+                        help="Architecture profile: run profile-specific detectors with healthy baselines")
 
 
 def run_exam(args):
     """Run examination (diagnosis only)."""
     if getattr(args, "json", False):
         args.quiet = True
+    verbose = getattr(args, "verbose", False) and not args.quiet
     if not args.quiet:
         print(f"Loading: {args.model}")
     state_dict, meta_dict = load_state_dict(args.model, hf=args.hf)
@@ -932,15 +2018,50 @@ def run_exam(args):
     if not args.quiet:
         print(f"Loaded {meta.num_tensors} tensors, {meta.num_params:,} parameters")
 
-    findings = diagnose(state_dict, meta_dict)
+    # Profile-based diagnosis
+    profile_name = getattr(args, "profile", None)
+    if profile_name:
+        from model_clinic._profiles import get_profile, auto_detect_profile
+        if profile_name == "auto":
+            profile = auto_detect_profile(state_dict)
+            if profile is None:
+                if not args.quiet:
+                    print("Could not auto-detect architecture profile, running full diagnosis")
+            else:
+                if not args.quiet:
+                    print(f"Auto-detected profile: {profile.name}")
+        else:
+            profile = get_profile(profile_name)
+        if profile_name != "auto" or (profile_name == "auto" and profile is not None):
+            if not args.quiet:
+                print(f"Using {profile.name} profile ({len(profile.detectors)} detectors)")
+            findings = profile.diagnose(state_dict, meta_dict, verbose=verbose)
+            # Show baseline comparison
+            if not args.quiet and not getattr(args, "json", False):
+                baselines = profile.healthy_baselines()
+                if baselines:
+                    print(f"\n  Healthy baselines for {profile.name}:")
+                    for metric, rng in baselines.items():
+                        parts = []
+                        if "min" in rng:
+                            parts.append(f"min={rng['min']}")
+                        if "max" in rng:
+                            parts.append(f"max={rng['max']}")
+                        print(f"    {metric}: {', '.join(parts)}")
+                    print()
+        else:
+            findings = diagnose(state_dict, meta_dict, verbose=verbose)
+    else:
+        findings = diagnose(state_dict, meta_dict, verbose=verbose)
 
     # Runtime diagnostics
+    runtime_prompts = EXAMPLE_RUNTIME_PROMPTS if getattr(args, "example_prompts", False) else None
     if args.runtime:
         if not args.quiet:
             print("\nRunning runtime diagnostics...")
         try:
             model, tokenizer, device = load_model(args.model, hf=args.hf)
-            runtime_findings = diagnose_runtime(model, tokenizer, device)
+            runtime_findings = diagnose_runtime(model, tokenizer, device, prompts=runtime_prompts)
             findings.extend(runtime_findings)
             del model, tokenizer
         except Exception as e:
@@ -955,15 +2076,24 @@ def run_exam(args):
     prescriptions = prescribe(findings)
     report = ExamReport(args.model, meta, findings, prescriptions)
 
+    health = compute_health_score(findings)
+
     if args.json:
-        print(json.dumps(report.to_dict(), indent=2, default=str))
+        report_dict = report.to_dict()
+        report_dict["health_score"] = {
+            "overall": health.overall,
+            "grade": health.grade,
+            "categories": health.categories,
+        }
+        print(json.dumps(report_dict, indent=2, default=str))
     else:
-        print_exam(findings, prescriptions)
+        print_exam(findings, prescriptions, explain=getattr(args, "explain", False))
+        print_health_score(health)
 
         # Verdict
         errors = sum(1 for f in findings if f.severity == "ERROR")
         warns = sum(1 for f in findings if f.severity == "WARN")
-        print(f"\n{'='*80}")
+        print(f"{'='*80}")
         if errors:
             print(f"VERDICT: UNHEALTHY ({errors} errors, {warns} warnings)")
         elif warns:
@@ -981,6 +2111,7 @@ def run_exam(args):
 
 def run_treat(args):
     """Run diagnosis and apply treatments."""
+    verbose = getattr(args, "verbose", False) and not args.quiet
     if not args.quiet:
         print(f"Loading: {args.model}")
     state_dict, meta_dict = load_state_dict(args.model, hf=args.hf)
@@ -989,12 +2120,13 @@ def run_treat(args):
         print(f"Loaded {meta.num_tensors} tensors, {meta.num_params:,} parameters")
 
     # Diagnose
-    findings = diagnose(state_dict, meta_dict)
+    findings = diagnose(state_dict, meta_dict, verbose=verbose)
 
+    runtime_prompts = EXAMPLE_RUNTIME_PROMPTS if getattr(args, "example_prompts", False) else None
     if args.runtime:
         try:
             model, tokenizer, device = load_model(args.model, hf=args.hf)
-            findings.extend(diagnose_runtime(model, tokenizer, device))
+            findings.extend(diagnose_runtime(model, tokenizer, device, prompts=runtime_prompts))
             del model, tokenizer
         except Exception as e:
             if not args.quiet:
@@ -1007,7 +2139,7 @@ def run_treat(args):
     prescriptions = prescribe(findings, conservative=getattr(args, "conservative", False))
 
     if not args.quiet:
-        print_exam(findings, prescriptions)
+        print_exam(findings, prescriptions, explain=getattr(args, "explain", False))
 
     if not prescriptions:
         if not args.quiet:
@@ -1045,13 +2177,21 @@ def run_treat(args):
     applied = []
     dry_run = getattr(args, "dry_run", False)
 
+    # Treatment manifest for audit logging
+    from model_clinic._manifest import TreatmentManifest
+    manifest = TreatmentManifest()
+
     for i, rx in enumerate(prescriptions):
+        if verbose:
+            print(f"  [{i+1}/{len(prescriptions)}] Applying {rx.name}...")
         result = apply_treatment(state_dict, rx, dry_run=dry_run)
         if not args.quiet:
             status = "OK" if result.success else "FAIL"
             risk = RISK_SYMBOL.get(rx.risk, rx.risk)
             print(f"  [{status}] Rx #{i+1} {rx.name} {risk}")
             print(f"    {result.description}")
+        if not dry_run:
+            manifest.record(result, state_dict)
         if result.success:
             applied.append(result)
 
@@ -1104,6 +2244,20 @@ def run_treat(args):
         if not args.quiet:
             print(f"\nSaved treated model to {args.save} ({patched} params patched)")
 
+        # Auto-save manifest alongside checkpoint
+        manifest_path = getattr(args, "manifest", None) or f"{args.save}.manifest.json"
+        manifest.save(manifest_path)
+        if not args.quiet:
+            manifest.print_summary()
+            print(f"Manifest saved to {manifest_path}")
+
+    # Explicit --manifest without --save (save manifest only)
+    elif getattr(args, "manifest", None) and not dry_run and applied:
+        manifest.save(args.manifest)
+        if not args.quiet:
+            manifest.print_summary()
+            print(f"Manifest saved to {args.manifest}")
+
     # Export
     if args.export:
         report = ExamReport(args.model, meta, findings, prescriptions,
@@ -1133,6 +2287,8 @@ def cli_main():
         parser.add_argument("--dry-run", action="store_true", help="Show what would change")
         parser.add_argument("--conservative", action="store_true", help="Only low-risk fixes")
         parser.add_argument("--no-rollback", action="store_true", help="Don't auto-rollback")
+        parser.add_argument("--manifest", type=str, default=None,
+                            help="Save treatment manifest to path (auto-saved with --save)")
 
     # Parse everything after the subcommand
     args = parser.parse_args(sys.argv[2:])

@@ -25,6 +25,7 @@ class Prescription:
     finding: Finding
     action: str           # treatment action identifier
     params: dict = field(default_factory=dict)
+    explanation: str = ""  # why this fix helps, what it changes
 
 
 @dataclass
@@ -34,6 +35,15 @@ class TreatmentResult:
     success: bool
     description: str
     backup: Any = None    # cloned tensor for rollback
+
+
+@dataclass
+class HealthScore:
+    """Model health score (0-100), like Lighthouse for neural networks."""
+    overall: int
+    categories: dict = field(default_factory=dict)
+    grade: str = "F"
+    summary: str = ""
 
 
 @dataclass
@@ -47,6 +57,51 @@ class ModelMeta:
     vocab_size: int = 0
     dtype: str = "float32"
     extra: dict = field(default_factory=dict)
+
+
+@dataclass
+class ExamResult:
+    """Result of examining a single model in a batch."""
+    path: str
+    findings: list = field(default_factory=list)
+    prescriptions: list = field(default_factory=list)
+    health_score: HealthScore = None
+    meta: ModelMeta = None
+    error: str = None
+
+
+@dataclass
+class PipelineResult:
+    """Result of running a treatment pipeline."""
+    findings: list = field(default_factory=list)
+    prescriptions: list = field(default_factory=list)
+    treatments: list = field(default_factory=list)
+    health_before: HealthScore = None
+    health_after: HealthScore = None
+
+
+@dataclass
+class MonitorAlert:
+    """An alert raised during training monitoring."""
+    step: int
+    condition: str        # "gradient_explosion", "neuron_death", "loss_spike", etc.
+    severity: str         # "WARN", "ERROR"
+    details: dict = field(default_factory=dict)
+    message: str = ""
+
+    def __str__(self):
+        return f"[{self.severity}] step {self.step}: {self.condition} — {self.message}"
+
+
+@dataclass
+class MonitorSummary:
+    """Summary of a training monitoring session."""
+    total_steps: int = 0
+    total_alerts: int = 0
+    alerts_by_condition: dict = field(default_factory=dict)
+    gradient_norm_history: list = field(default_factory=list)
+    loss_history: list = field(default_factory=list)
+    dead_neuron_history: list = field(default_factory=list)
 
 
 @dataclass
@@ -78,8 +133,11 @@ class ExamReport:
                 for f in self.findings
             ],
             "prescriptions": [
-                {"name": rx.name, "risk": rx.risk, "action": rx.action,
-                 "description": rx.description, "param": rx.finding.param_name}
+                {k: v for k, v in [
+                    ("name", rx.name), ("risk", rx.risk), ("action", rx.action),
+                    ("description", rx.description), ("param", rx.finding.param_name),
+                    ("explanation", rx.explanation),
+                ] if v}
                 for rx in self.prescriptions
             ],
             "treatments": [

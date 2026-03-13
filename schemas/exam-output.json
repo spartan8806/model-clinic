@@ -1,0 +1,180 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "model-clinic Exam Report",
+  "description": "Output schema for model-clinic exam --json",
+  "type": "object",
+  "properties": {
+    "model": {
+      "type": "string",
+      "description": "Path to the examined model"
+    },
+    "meta": {
+      "type": "object",
+      "description": "Model metadata",
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Model source type",
+          "enum": ["huggingface", "checkpoint", "safetensors", "unknown"]
+        },
+        "num_params": {
+          "type": "integer",
+          "description": "Total number of parameters"
+        },
+        "num_tensors": {
+          "type": "integer",
+          "description": "Total number of tensors"
+        },
+        "hidden_size": {
+          "type": "integer",
+          "description": "Hidden dimension size"
+        },
+        "num_layers": {
+          "type": "integer",
+          "description": "Number of layers"
+        }
+      },
+      "required": ["source", "num_params", "num_tensors", "hidden_size", "num_layers"]
+    },
+    "findings": {
+      "type": "array",
+      "description": "Diagnosed issues in the model",
+      "items": {
+        "type": "object",
+        "properties": {
+          "condition": {
+            "type": "string",
+            "description": "Condition identifier (e.g. dead_neurons, stuck_gate_closed)"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["ERROR", "WARN", "INFO"],
+            "description": "Severity level"
+          },
+          "param": {
+            "type": "string",
+            "description": "Affected parameter name"
+          },
+          "details": {
+            "type": "object",
+            "description": "Additional condition-specific details"
+          }
+        },
+        "required": ["condition", "severity", "param"]
+      }
+    },
+    "prescriptions": {
+      "type": "array",
+      "description": "Recommended treatments for findings",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Treatment name"
+          },
+          "risk": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Risk level of the treatment"
+          },
+          "action": {
+            "type": "string",
+            "description": "Treatment action identifier"
+          },
+          "description": {
+            "type": "string",
+            "description": "Human-readable description of the treatment"
+          },
+          "param": {
+            "type": "string",
+            "description": "Target parameter name"
+          },
+          "explanation": {
+            "type": "string",
+            "description": "Why this fix helps and what it changes"
+          }
+        }
+      }
+    },
+    "treatments": {
+      "type": "array",
+      "description": "Applied treatment results",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Treatment name"
+          },
+          "success": {
+            "type": "boolean",
+            "description": "Whether the treatment succeeded"
+          },
+          "description": {
+            "type": "string",
+            "description": "Description of what was done"
+          }
+        },
+        "required": ["name", "success", "description"]
+      }
+    },
+    "before_score": {
+      "type": ["number", "null"],
+      "description": "Evaluation score before treatment"
+    },
+    "before_ppl": {
+      "type": ["number", "null"],
+      "description": "Perplexity before treatment"
+    },
+    "after_score": {
+      "type": ["number", "null"],
+      "description": "Evaluation score after treatment"
+    },
+    "after_ppl": {
+      "type": ["number", "null"],
+      "description": "Perplexity after treatment"
+    },
+    "health_score": {
+      "type": "object",
+      "description": "Overall model health assessment",
+      "properties": {
+        "overall": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Overall health score"
+        },
+        "grade": {
+          "type": "string",
+          "enum": ["A", "B", "C", "D", "F"],
+          "description": "Letter grade"
+        },
+        "categories": {
+          "type": "object",
+          "description": "Per-category health scores",
+          "properties": {
+            "weights": {
+              "type": "integer",
+              "description": "Weight health score"
+            },
+            "stability": {
+              "type": "integer",
+              "description": "Stability score"
+            },
+            "output": {
+              "type": "integer",
+              "description": "Output quality score"
+            },
+            "activations": {
+              "type": "integer",
+              "description": "Activation health score"
+            }
+          }
+        }
+      },
+      "required": ["overall", "grade", "categories"]
+    }
+  },
+  "required": ["model", "meta", "findings", "health_score"]
+}

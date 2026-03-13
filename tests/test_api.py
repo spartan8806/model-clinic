@@ -8,7 +8,7 @@ class TestPublicAPI:
 
     def test_version(self):
         import model_clinic
-        assert model_clinic.__version__ == "0.2.0"
+        assert model_clinic.__version__ == "0.3.0"
 
     def test_types_importable(self):
         from model_clinic import Finding, Prescription, TreatmentResult, ExamReport, ModelMeta

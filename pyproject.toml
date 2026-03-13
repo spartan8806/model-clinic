@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "model-clinic"
-version = "0.2.0"
+version = "0.3.0"
 description = "Diagnose, treat, and understand neural network models"
 readme = "README.md"
 license = "MIT"
@@ -12,24 +12,53 @@ requires-python = ">=3.10"
 authors = [
     { name = "Connor", email = "connor@atles.dev" },
 ]
-keywords = ["pytorch", "model-analysis", "interpretability", "debugging", "neural-networks"]
+keywords = [
+    "pytorch",
+    "model-analysis",
+    "interpretability",
+    "debugging",
+    "neural-networks",
+    "deep-learning",
+    "model-health",
+    "diagnostics",
+    "llm",
+    "fine-tuning",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
 ]
 dependencies = [
     "torch>=2.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/spartan8806/model-clinic"
+Repository = "https://github.com/spartan8806/model-clinic"
+Documentation = "https://github.com/spartan8806/model-clinic#readme"
+"Bug Tracker" = "https://github.com/spartan8806/model-clinic/issues"
+Changelog = "https://github.com/spartan8806/model-clinic/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 hf = ["transformers>=4.36"]
 safetensors = ["safetensors>=0.4.0"]
-all = ["transformers>=4.36", "safetensors>=0.4.0"]
-dev = ["pytest>=7.0", "pytest-timeout", "pytest-cov"]
+onnx = ["onnx>=1.14"]
+wandb = ["wandb>=0.15"]
+mlflow = ["mlflow>=2.0"]
+tensorboard = ["tensorboard>=2.0"]
+all = ["transformers>=4.36", "safetensors>=0.4.0", "onnx>=1.14", "wandb>=0.15", "mlflow>=2.0", "tensorboard>=2.0"]
+dev = ["pytest>=7.0", "pytest-timeout", "pytest-cov", "build>=1.0"]
 
 [project.scripts]
 model-clinic = "model_clinic.cli:main"
@@ -41,9 +70,24 @@ model-ablate = "model_clinic._tools.ablate:main"
 model-neurons = "model_clinic._tools.neurons:main"
 model-attention = "model_clinic._tools.attention:main"
 model-logit-lens = "model_clinic._tools.logit_lens:main"
+model-validate = "model_clinic._tools.validate:main"
+model-report = "model_clinic._tools.report:main"
+model-compare = "model_clinic._tools.compare:main"
+model-demo = "model_clinic._tools.demo:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/model_clinic"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/schemas",
+    "/action.yml",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/README.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -18,6 +18,17 @@ DEFAULT_PROMPTS = [
     "What are the three states of matter?",
 ]
 
+EXAMPLE_RUNTIME_PROMPTS = [
+    "What is the capital of France?",
+    "Explain how photosynthesis works in simple terms.",
+    "Write a short poem about the ocean.",
+    "What is 15 multiplied by 7?",
+    "List three differences between Python and JavaScript.",
+    "Summarize the theory of relativity in one paragraph.",
+    "What causes thunder and lightning?",
+    "Translate 'hello world' into Spanish.",
+]
+
 
 def generate(model, tokenizer, device, prompt, max_tokens=60):
     """Generate a response from a prompt. Returns response string."""

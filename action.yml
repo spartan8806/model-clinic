@@ -1,0 +1,44 @@
+name: 'Model Health Check'
+description: 'Run model-clinic health checks on PyTorch model checkpoints'
+inputs:
+  model-path:
+    description: 'Path to model checkpoint'
+    required: true
+  threshold:
+    description: 'Minimum health score (0-100) to pass'
+    required: false
+    default: '60'
+  format:
+    description: 'Output format (text or json)'
+    required: false
+    default: 'text'
+  extra-args:
+    description: 'Additional arguments to pass to model-clinic exam'
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    - name: Install model-clinic
+      shell: bash
+      run: pip install model-clinic
+    - name: Run health check
+      shell: bash
+      run: |
+        if [ "${{ inputs.format }}" = "json" ]; then
+          model-clinic exam "${{ inputs.model-path }}" --json ${{ inputs.extra-args }} | tee health-report.json
+          SCORE=$(python -c "import json; d=json.load(open('health-report.json')); print(d['health_score']['overall'])")
+        else
+          model-clinic exam "${{ inputs.model-path }}" ${{ inputs.extra-args }}
+          SCORE=$(model-clinic exam "${{ inputs.model-path }}" --json ${{ inputs.extra-args }} | python -c "import json,sys; print(json.load(sys.stdin)['health_score']['overall'])")
+        fi
+        echo "health_score=$SCORE" >> $GITHUB_OUTPUT
+        if [ "$SCORE" -lt "${{ inputs.threshold }}" ]; then
+          echo "::error::Model health score $SCORE is below threshold ${{ inputs.threshold }}"
+          exit 1
+        fi
+      id: health-check
+outputs:
+  health-score:
+    description: 'The model health score (0-100)'
+    value: ${{ steps.health-check.outputs.health_score }}

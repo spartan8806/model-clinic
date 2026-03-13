@@ -60,7 +60,8 @@ class TestDetectors:
         assert findings[0].details["inf_count"] == 1
 
     def test_norm_drift(self):
-        t = torch.full((64,), 2.5)
+        # threshold is 1.5: |mean - 1.0| > 1.5, so mean must exceed 2.5
+        t = torch.full((64,), 3.0)
         findings = detect_norm_drift("final_norm.weight", t, {})
         assert len(findings) == 1
         assert findings[0].condition == "norm_drift"

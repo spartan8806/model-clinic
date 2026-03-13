@@ -1,0 +1,30 @@
+name: Model Health Check
+
+on:
+  push:
+    paths:
+      - 'checkpoints/**'
+      - 'models/**'
+  pull_request:
+    paths:
+      - 'checkpoints/**'
+      - 'models/**'
+  workflow_dispatch:
+    inputs:
+      model-path:
+        description: 'Path to model checkpoint'
+        required: true
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run model health check
+        uses: spartan8806/model-clinic@v0.3.0
+        with:
+          model-path: ${{ github.event.inputs.model-path || 'checkpoints/model.pt' }}
+          threshold: 60

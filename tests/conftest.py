@@ -47,8 +47,8 @@ def sick_state_dict():
         # Dead neurons: row 0 and 1 are zero
         "layers.0.mlp.down_proj.weight": torch.randn(64, 256),
 
-        # Drifted norm
-        "final_norm.weight": torch.full((64,), 2.5),
+        # Drifted norm (threshold is 1.5: |mean - 1.0| > 1.5 → mean must exceed 2.5)
+        "final_norm.weight": torch.full((64,), 3.0),
 
         # Gate stuck closed
         "wrapper/gate": torch.tensor(-10.0),
