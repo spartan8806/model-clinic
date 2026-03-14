@@ -77,6 +77,10 @@ def main():
         "autopsy": "model_clinic._tools.autopsy",
         "prune-suggest": "model_clinic._tools.prune_suggest",
         "dashboard": "model_clinic._tools.dashboard",
+        "spectral": "model_clinic._tools.spectral_cmd",
+        "graft": "model_clinic._tools.graft_cmd",
+        "activation-audit": "model_clinic._tools.activation_cmd",
+        "activation-repair": "model_clinic._tools.activation_cmd",
     }
 
     if command in _TOOL_MAP:
@@ -165,6 +169,10 @@ Commands:
   mri         Deep per-layer weight analysis using SVD decomposition
   autopsy     Deep forensic analysis for dead or severely broken models
   prune-suggest   Static pruning opportunity analysis (no forward pass)
+  spectral    SVD spectral analysis and denoising (repair high condition numbers)
+  graft       Cross-checkpoint grafting: merge healthiest parts of multiple checkpoints
+  activation-audit   Per-layer activation stats (requires model class)
+  activation-repair  Detect and fix destructive layers (requires model class)
   plugins     List installed model-clinic plugins
   new-plugin  Scaffold a new plugin package
 

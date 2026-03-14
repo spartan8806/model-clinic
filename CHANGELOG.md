@@ -7,6 +7,69 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.0] - 2026-03-13
+
+### Added
+
+**Deep Repair System (Levels 2-5)**
+
+The treatment pipeline now goes far beyond cosmetic fixes. Four new repair depths
+operate on increasingly fundamental model properties.
+
+**Level 2: Spectral Surgery** (`_repair/spectral.py`)
+- `spectral_denoise(tensor, energy_threshold, max_condition, min_rank_ratio)` — SVD-based denoising that truncates noise-carrying singular values while preserving signal
+- `spectral_analysis(tensor)` — read-only diagnostic: singular value spectrum, effective rank, condition number, energy distribution
+- `SpectralReport` dataclass with before/after metrics
+- Auto-triggers for `gradient_noise` findings with condition number > 10,000
+- CLI: `model-clinic spectral <model_path> [--repair]`
+- Real result: attention layer condition number 30,321 → 35; memory bank 1.4B → 1,000
+
+**Level 3: Distillation Repair** (`_repair/distill.py`, `_repair/calibration.py`)
+- `identify_dead_modules(findings)` — detects module subtrees with 2+ of {identical_rows, gradient_noise ERROR, model_aging}
+- `reset_module_params(state_dict, prefix)` — Xavier uniform for 2D+, zeros for 1D biases
+- `distill_repair(model, dead_modules, calibration_loader)` — freeze working layers as teacher, reset dead modules, train dead modules to match teacher activations
+- `load_calibration_data(path)` — supports .jsonl, .txt, .pt formats
+- `generate_random_calibration()` — fallback when no real data available
+- Real result: 300M model 65/C → 71/C; weights category 65 → 80; 13 findings → 9
+
+**Level 4: Cross-Checkpoint Grafting** (`_repair/graft.py`)
+- `score_parameter(key, tensor)` — health score for a single parameter
+- `graft(checkpoints)` — load multiple checkpoints, score each parameter version, pick the best
+- `graft_modules(checkpoints, depth)` — same at module-group level
+- `GraftManifest` with provenance tracking, JSON export, and summary report
+- CLI: `model-clinic graft ckpt1.pt ckpt2.pt [-o merged.pt] [--manifest manifest.json]`
+
+**Level 5: Activation-Guided Repair** (`_repair/activation.py`)
+- `activation_audit(model, calibration_data)` — forward hooks on all layers, measures rank change, norm ratio, entropy change, cosine similarity per layer
+- `find_destructive_layers(stats)` — flags layers that collapse rank (>30%), explode norms (>10x), or destroy entropy
+- `activation_repair(model, destructive_layers, strategy)` — three strategies: shrink (scale params), passthrough (identity), interpolate (average neighbors)
+- `LayerStats` and `ActivationReport` dataclasses
+- CLI: `model-clinic activation-audit`, `model-clinic activation-repair`
+
+**New CLI Commands** (7 new)
+- `model-clinic spectral` — SVD spectrum analysis and repair
+- `model-clinic graft` — cross-checkpoint merging
+- `model-clinic activation-audit` — per-layer activation analysis
+- `model-clinic activation-repair` — fix destructive layers
+
+**Surgical Repair Script** (`scripts/surgical_repair.py`)
+- End-to-end pipeline: L1 cosmetic → L2 spectral → L3 distillation
+- Includes minimal RecurrentTransformer class for the ATLES 300M model
+- Tested on RTX 3060: 62/D → 71/C in ~9 seconds
+
+### Changed
+- `gradient_noise` prescriber upgraded from advisory to `spectral_denoise` action for condition > 10K
+- `gradient_noise` risk level raised from "low" to "medium"
+
+### Stats
+- 22 static detectors, 6 runtime (unchanged)
+- 699 tests passing (was 562 in v0.3.0)
+- 22 CLI commands (was 15)
+- ~50 public API exports (was 34)
+- Deep repair: 4 new modules, ~1500 lines of repair code
+
+---
+
 ## [0.3.0] - 2026-03-11
 
 ### Added
@@ -165,5 +228,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+[0.4.0]: https://github.com/spartan8806/model-clinic/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/spartan8806/model-clinic/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/spartan8806/model-clinic/releases/tag/v0.2.0

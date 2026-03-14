@@ -1246,6 +1246,39 @@ def _rx_reset_norm(f):
         ),
     )
 
+def _rx_spectral_denoise(f):
+    """Prescribe spectral denoising for gradient_noise findings with high condition numbers."""
+    cond = f.details.get("condition_number", 0)
+    if cond > 10_000:
+        return Prescription(
+            name="spectral_denoise",
+            description=f"Spectral denoising for {f.param_name} (condition={cond:.0f})",
+            risk="medium",
+            finding=f,
+            action="spectral_denoise",
+            params={
+                "energy_threshold": 0.99,
+                "max_condition": 1000,
+                "min_rank_ratio": 0.1,
+            },
+            explanation=(
+                f"This parameter has a condition number of {cond:.0f}, indicating "
+                f"near-singular directions that amplify noise during training. "
+                f"Spectral denoising removes the smallest singular values to cap "
+                f"the condition number at 1000, retaining 99% of spectral energy."
+            ),
+        )
+    # Fall through to advisory for moderate condition numbers
+    return Prescription(
+        name=f"advisory_{f.condition}",
+        description=f"Advisory: {f.condition} detected in {f.param_name}",
+        risk="low", finding=f, action="advisory",
+        explanation=(
+            "This is an advisory finding — no automatic fix is available. "
+            "Manual investigation is recommended."
+        ),
+    )
+
 def _rx_desaturate(f):
     return Prescription(
         name="desaturate",
@@ -1328,8 +1361,8 @@ REGISTRY.register("positional_encoding_issues", detect_positional_issues, risk="
                    description="Broken or degenerate positional encodings")
 REGISTRY.register("token_collapse", detect_token_collapse, _rx_advisory, "low",
                    "Near-identical output token embeddings")
-REGISTRY.register("gradient_noise", detect_gradient_noise, _rx_advisory, "low",
-                   "High condition number predicts gradient instability")
+REGISTRY.register("gradient_noise", detect_gradient_noise, _rx_spectral_denoise, "medium",
+                   "Spectral denoising for high condition number (gradient instability)")
 REGISTRY.register("_collect_layer_norms", _collect_layer_norms, risk="low",
                    description="Collector for representation drift detection")
 REGISTRY.register("moe_router_collapse", detect_moe_router_collapse, _rx_advisory, "low",
@@ -1650,6 +1683,27 @@ def _do_treatment(tensor, rx):
                     tensor[row] += torch.randn_like(tensor[row]) * noise_scale
                 return True, f"Perturbed {min(len(dups), 100)} near-duplicate rows"
         return False, "Not a 2D tensor"
+
+    elif action == "spectral_denoise":
+        from model_clinic._repair.spectral import spectral_denoise_with_report
+        with torch.no_grad():
+            energy_threshold = params.get("energy_threshold", 0.99)
+            max_condition = params.get("max_condition", 1000)
+            min_rank_ratio = params.get("min_rank_ratio", 0.1)
+            denoised, report = spectral_denoise_with_report(
+                tensor, rx.finding.param_name,
+                energy_threshold=energy_threshold,
+                max_condition=max_condition,
+                min_rank_ratio=min_rank_ratio,
+            )
+            if report.effective_rank < report.original_rank:
+                tensor.copy_(denoised)
+                return True, (
+                    f"Spectral denoise: rank {report.original_rank} -> {report.effective_rank}, "
+                    f"cond {report.condition_before:.0f} -> {report.condition_after:.0f}, "
+                    f"energy retained {report.energy_retained:.4f}"
+                )
+            return True, "Already well-conditioned — no change needed"
 
     elif action == "advisory":
         return True, "Advisory only — no automatic fix"

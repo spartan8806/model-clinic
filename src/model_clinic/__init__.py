@@ -28,6 +28,13 @@ from model_clinic._synthetic import SYNTHETIC_MODELS, make_healthy_mlp, make_eve
 from model_clinic._plugins import load_plugins, list_plugins
 from model_clinic._tools.prune_suggest import prune_suggestions
 from model_clinic._tools.autopsy import autopsy
+from model_clinic._repair.spectral import spectral_denoise, spectral_analysis, SpectralReport
+from model_clinic._repair.graft import graft, graft_modules, score_parameter, GraftManifest
+from model_clinic._repair.distill import identify_dead_modules, reset_module_params, distill_repair, DistillReport
+from model_clinic._repair.activation import (
+    activation_audit, activation_repair, find_destructive_layers,
+    ActivationReport, LayerStats,
+)
 from model_clinic._mri import model_mri, mri_summary, LayerMRI
 from model_clinic._profiles import ArchProfile, get_profile, auto_detect_profile, list_profiles
 from model_clinic._badge import (
@@ -107,4 +114,24 @@ __all__ = [
     # Autopsy and pruning
     "autopsy",
     "prune_suggestions",
+    # Spectral surgery (Level 2)
+    "spectral_denoise",
+    "spectral_analysis",
+    "SpectralReport",
+    # Grafting (cross-checkpoint repair)
+    "graft",
+    "graft_modules",
+    "score_parameter",
+    "GraftManifest",
+    # Distillation repair (Level 3)
+    "identify_dead_modules",
+    "reset_module_params",
+    "distill_repair",
+    "DistillReport",
+    # Activation-guided repair (Level 5)
+    "activation_audit",
+    "activation_repair",
+    "find_destructive_layers",
+    "ActivationReport",
+    "LayerStats",
 ]
