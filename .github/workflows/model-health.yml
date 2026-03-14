@@ -35,4 +35,4 @@ jobs:
         run: |
           MODEL_PATH="${{ github.event.inputs.model-path || 'checkpoints/model.pt' }}"
           echo "Checking: $MODEL_PATH"
-          model-clinic check "$MODEL_PATH" --threshold 60
+          model-clinic exam "$MODEL_PATH" --json
