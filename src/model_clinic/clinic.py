@@ -42,11 +42,12 @@ DEAD_NEURON_THRESHOLD = 1e-7        # Norm below this = dead
 GATE_CLOSED_THRESHOLD = 0.01       # sigmoid below this = stuck closed
 GATE_OPEN_THRESHOLD = 0.99         # sigmoid above this = stuck open
 EXPLODING_NORM_THRESHOLD = 10.0    # Per-element norm above this = exploding
+EXPLODING_NORM_BIAS_THRESHOLD = 40.0  # Bias tensors naturally have higher norms (Qwen k_proj.bias ~32)
 VANISHING_NORM_THRESHOLD = 1e-6    # Per-element norm below this = vanishing
-KURTOSIS_THRESHOLD = 50            # Kurtosis above this = heavy tails
-NORM_DRIFT_THRESHOLD = 1.5         # |mean - 1.0| above this = drifted (pretraining shifts norms naturally)
+KURTOSIS_THRESHOLD = 300           # Kurtosis above this = heavy tails (pretrained models have 40-250 normally; Qwen layernorm ~255)
+NORM_DRIFT_THRESHOLD = 10.0        # |mean - 1.0| above this = drifted (RMSNorm weights reach 7+ in healthy pretrained models like Qwen)
 SATURATION_THRESHOLD = 0.3         # Fraction near max above this = saturated
-SIMILARITY_THRESHOLD = 0.999       # Cosine sim above this = duplicate rows
+SIMILARITY_THRESHOLD = 0.9999      # Cosine sim above this = duplicate rows (raised from 0.999; pretrained models have occasional 0.999 pairs)
 MAX_TENSOR_ELEMENTS = 50_000_000   # Skip tensors larger than this for expensive ops
 MAX_TENSOR_PAIRWISE = 10_000_000   # Skip tensors larger than this for pairwise ops
 KURTOSIS_SAMPLE_SIZE = 1_000_000   # Sample size for kurtosis estimation
@@ -200,7 +201,9 @@ def detect_exploding_norm(name, tensor, ctx):
     if tensor.numel() <= 10:
         return []
     per_elem = _per_elem_norm(tensor)
-    if per_elem > EXPLODING_NORM_THRESHOLD:
+    # Bias tensors and attention projections naturally have higher norms
+    threshold = EXPLODING_NORM_BIAS_THRESHOLD if "bias" in name.lower() else EXPLODING_NORM_THRESHOLD
+    if per_elem > threshold:
         return [Finding("exploding_norm", "WARN", name,
                         {"per_elem_norm": per_elem, "shape": list(tensor.shape)})]
     return []
@@ -497,10 +500,11 @@ def detect_gradient_noise(name, tensor, ctx):
         if len(sv_pos) < 2:
             return []
         condition_number = (sv_pos[0] / sv_pos[-1]).item()
-        # Condition numbers up to ~50K are common in healthy pretrained models.
-        # Only flag at 50K+ (WARN) or 1M+ (ERROR) for real instability.
-        if condition_number > 50_000:
-            severity = "WARN" if condition_number < 1_000_000 else "ERROR"
+        # Condition numbers up to ~500K are common in healthy pretrained models
+        # (Qwen q_proj: 162K-630K, o_proj: 114K). Only flag at 500K+ (WARN)
+        # or 5M+ (ERROR) for real instability.
+        if condition_number > 500_000:
+            severity = "WARN" if condition_number < 5_000_000 else "ERROR"
             return [Finding(
                 "gradient_noise", severity, name,
                 {"condition_number": condition_number,
@@ -668,40 +672,38 @@ def detect_quantization_degradation(name, tensor, ctx):
     unique_ratio = n_unique / sample_size
     findings = []
 
-    # For bf16/fp16: only flag if unique count is extremely low (< 256 unique
-    # values = likely INT8 or aggressive quantization) AND grid pattern detected
-    # For fp32: use the original thresholds
-    if is_low_precision:
-        threshold = 256  # absolute count, not ratio
-        if n_unique >= threshold:
-            return []
-    elif unique_ratio >= 0.05:
-        return []
-
-    if not is_low_precision and unique_ratio < 0.05:
-        severity = "WARN" if unique_ratio < 0.01 else "INFO"
-    elif is_low_precision:
-        severity = "WARN" if n_unique < 64 else "INFO"
-    else:
-        severity = "INFO"
-
-    details = {
-        "unique_values": n_unique,
-        "sample_size": sample_size,
-        "unique_ratio": unique_ratio,
-        "shape": list(tensor.shape),
-    }
-    # Check for grid-quantized values (uniform spacing)
+    # Check for grid-quantized pattern (uniform spacing between values).
+    # Grid pattern = actual quantization (INT8, GPTQ, AWQ).
+    # Non-grid low unique ratio = natural precision limit (bf16, or fp32 loaded from bf16).
+    is_grid = False
+    cv = 1.0
     if n_unique >= 2:
         sorted_unique = unique_vals.sort().values
         spacings = sorted_unique[1:] - sorted_unique[:-1]
         if spacings.numel() > 1:
             mean_spacing = spacings.mean().item()
             std_spacing = spacings.std().item()
-            if mean_spacing > 0:
-                cv = std_spacing / mean_spacing
-                details["spacing_cv"] = cv
-                details["grid_quantized"] = cv < 0.1
+            cv = std_spacing / mean_spacing if mean_spacing > 0 else 1.0
+            is_grid = cv < 0.1
+
+    # Only flag if grid-quantized. Non-grid low unique ratio is normal for
+    # bf16 tensors or fp32 tensors loaded from bf16 (retains limited precision).
+    if not is_grid:
+        return []
+
+    if is_low_precision:
+        severity = "WARN" if n_unique < 64 else "INFO"
+    else:
+        severity = "WARN" if unique_ratio < 0.01 else "INFO"
+
+    details = {
+        "unique_values": n_unique,
+        "sample_size": sample_size,
+        "unique_ratio": unique_ratio,
+        "shape": list(tensor.shape),
+        "spacing_cv": cv,
+        "grid_quantized": True,
+    }
     findings.append(Finding(
         "quantization_degradation", severity, name, details,
     ))
@@ -858,7 +860,7 @@ def post_detect_attention_imbalance(ctx):
             continue
         vals = list(norms.values())
         ratio = max(vals) / max(min(vals), 1e-10)
-        if ratio > 10:
+        if ratio > 50:
             findings.append(Finding(
                 "attention_imbalance", "WARN", layer_key,
                 {"norms": norms, "ratio": ratio}
@@ -993,9 +995,9 @@ def post_detect_causal_outlier(ctx):
             continue
         for entry in entries:
             ratio = entry["per_elem_norm"] / mean_norm
-            if ratio > 3.0:
+            if ratio > 5.0:
                 severity = "ERROR"
-            elif ratio > 2.0:
+            elif ratio > 3.0:
                 severity = "WARN"
             else:
                 continue

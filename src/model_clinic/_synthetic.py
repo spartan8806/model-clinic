@@ -68,7 +68,7 @@ def make_exploding_model(hidden=256, layers=4, scale=1000):
     return sd
 
 
-def make_norm_drift_model(hidden=256, layers=4, drift=3.0):
+def make_norm_drift_model(hidden=256, layers=4, drift=15.0):
     """Create a model with drifted LayerNorm weights."""
     sd = make_healthy_mlp(hidden, layers)
     for i in range(layers):
@@ -94,7 +94,7 @@ def make_heavy_tails_model(hidden=256, layers=4, kurtosis_target=100):
         n_outliers = max(1, w.numel() // 100)
         flat = w.flatten()
         outlier_idx = torch.randperm(flat.numel())[:n_outliers]
-        flat[outlier_idx] = torch.randn(n_outliers) * 50
+        flat[outlier_idx] = torch.randn(n_outliers) * 150
         sd[f"layers.{i}.linear.weight"] = flat.reshape(w.shape)
     return sd
 
@@ -143,7 +143,7 @@ def make_everything_broken(hidden=256, layers=6):
     sd["layers.2.linear.weight"] *= 500
 
     # Norm drift (layer 3)
-    sd["layers.3.norm.weight"] = torch.ones(hidden) * 5.0
+    sd["layers.3.norm.weight"] = torch.ones(hidden) * 15.0
 
     # Saturated weights (layer 4)
     w = sd["layers.4.linear.weight"]

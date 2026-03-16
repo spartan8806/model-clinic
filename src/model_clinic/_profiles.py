@@ -142,8 +142,8 @@ _LLM_PROFILE = ArchProfile(
     ],
     baselines={
         "per_element_norm": {"min": 0.01, "max": 5.0},
-        "norm_weight_mean": {"min": 0.8, "max": 1.5},
-        "kurtosis": {"max": 50},
+        "norm_weight_mean": {"min": 0.8, "max": 11.0},
+        "kurtosis": {"max": 300},
         "dead_neuron_fraction": {"max": 0.05},
         "head_cosine_similarity": {"max": 0.95},
     },
@@ -151,7 +151,7 @@ _LLM_PROFILE = ArchProfile(
         "quantization_degradation",  # bf16 is standard in LLMs, not a defect
     ],
     notes=[
-        "Qwen2.5-0.5B-Instruct baseline: 61/D with 15 findings",
+        "Qwen2.5-0.5B-Instruct baseline: ~90/A after threshold calibration",
         "bf16 is the standard dtype for modern LLMs -- quantization_degradation is suppressed",
     ],
 )

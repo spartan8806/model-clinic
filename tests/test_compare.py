@@ -31,7 +31,7 @@ def _make_sick_sd():
         "layers.0.mlp.gate_proj.weight": torch.randn(256, 64),
         "layers.0.mlp.down_proj.weight": torch.randn(64, 256),
         "layers.0.attn_norm.weight": torch.ones(64),
-        "final_norm.weight": torch.full((64,), 2.5),  # norm drift
+        "final_norm.weight": torch.full((64,), 15.0),  # norm drift
         "lm_head.weight": torch.randn(100, 64),
     }
     # Dead neurons

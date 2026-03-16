@@ -18,11 +18,11 @@ class TestCausalOutlier:
     def test_fires_on_large_norm_outlier(self):
         """A tensor with much larger norm than same-type peers should fire ERROR."""
         ctx = {}
-        # Use 7 normal layers + 1 outlier at 10x to ensure ratio > 3x after mean dilution
+        # Use 7 normal layers + 1 outlier at 50x to ensure ratio > 5x after mean dilution
         torch.manual_seed(0)
         for i in range(7):
             _collect_causal_norms(f"layers.{i}.mlp.down_proj.weight", torch.randn(64, 64), ctx)
-        _collect_causal_norms("layers.7.mlp.down_proj.weight", torch.randn(64, 64) * 10.0, ctx)
+        _collect_causal_norms("layers.7.mlp.down_proj.weight", torch.randn(64, 64) * 50.0, ctx)
 
         findings = post_detect_causal_outlier(ctx)
         assert len(findings) >= 1
@@ -30,7 +30,7 @@ class TestCausalOutlier:
         assert len(outlier_findings) == 1
         assert outlier_findings[0].condition == "causal_outlier"
         assert outlier_findings[0].severity == "ERROR"
-        assert outlier_findings[0].details["ratio"] > 3.0
+        assert outlier_findings[0].details["ratio"] > 5.0
 
     def test_no_fire_on_healthy(self):
         """Healthy tensors with similar norms should not fire."""
@@ -46,12 +46,11 @@ class TestCausalOutlier:
     def test_warn_on_moderate_outlier(self):
         """A tensor with moderately higher norm should fire WARN (not ERROR)."""
         ctx = {}
-        # 7 normal + 1 at 5x: mean ~ (7*1 + 5)/8 = 1.5, ratio = 5/1.5 = 3.3 -> ERROR
-        # 7 normal + 1 at 4x: mean ~ (7*1 + 4)/8 = 1.375, ratio = 4/1.375 = 2.9 -> WARN
+        # 7 normal + 1 at 10x: mean ~ (7*1 + 10)/8 = 2.125, ratio = 10/2.125 = 4.7 -> WARN (3-5x)
         torch.manual_seed(0)
         for i in range(7):
             _collect_causal_norms(f"layers.{i}.attention.q_proj.weight", torch.randn(64, 64), ctx)
-        _collect_causal_norms("layers.7.attention.q_proj.weight", torch.randn(64, 64) * 4.0, ctx)
+        _collect_causal_norms("layers.7.attention.q_proj.weight", torch.randn(64, 64) * 10.0, ctx)
 
         findings = post_detect_causal_outlier(ctx)
         outlier_findings = [f for f in findings if "layers.7" in f.param_name]

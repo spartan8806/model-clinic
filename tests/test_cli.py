@@ -43,7 +43,7 @@ class TestCLI:
 
     def test_exam_on_sick_checkpoint(self, tmp_path):
         """model-clinic exam should find issues in sick model."""
-        sd = {"weight": torch.randn(64, 64), "norm.weight": torch.full((64,), 3.0)}
+        sd = {"weight": torch.randn(64, 64), "norm.weight": torch.full((64,), 15.0)}
         sd["weight"][0, 0] = float("nan")
         path = tmp_path / "sick.pt"
         torch.save({"model_state_dict": sd}, str(path))
@@ -73,7 +73,7 @@ class TestCLI:
 
     def test_treat_and_save(self, tmp_path):
         """model-clinic treat --save should create treated checkpoint."""
-        sd = {"norm.weight": torch.full((64,), 3.0)}
+        sd = {"norm.weight": torch.full((64,), 15.0)}
         path = tmp_path / "sick.pt"
         out_path = tmp_path / "treated.pt"
         torch.save({"model_state_dict": sd}, str(path))
@@ -123,7 +123,7 @@ class TestCLI:
 
     def test_verbose_flag_accepted_treat(self, tmp_path):
         """--verbose flag should be accepted by treat."""
-        sd = {"norm.weight": torch.full((64,), 3.0)}
+        sd = {"norm.weight": torch.full((64,), 15.0)}
         path = tmp_path / "test.pt"
         torch.save({"model_state_dict": sd}, str(path))
 
@@ -137,7 +137,7 @@ class TestCLI:
 
     def test_verbose_treat_shows_applying_count(self, tmp_path):
         """--verbose during treat should show [N/M] Applying ... messages."""
-        sd = {"norm.weight": torch.full((64,), 3.0)}
+        sd = {"norm.weight": torch.full((64,), 15.0)}
         path = tmp_path / "test.pt"
         torch.save({"model_state_dict": sd}, str(path))
 

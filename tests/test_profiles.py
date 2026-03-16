@@ -202,7 +202,7 @@ class TestProfileBaselines:
     def test_llm_baselines_have_kurtosis(self):
         b = get_profile("llm").healthy_baselines()
         assert "kurtosis" in b
-        assert b["kurtosis"]["max"] == 50
+        assert b["kurtosis"]["max"] == 300
 
     def test_vit_baselines_differ_from_llm(self):
         llm_b = get_profile("llm").healthy_baselines()

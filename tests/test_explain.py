@@ -93,7 +93,7 @@ class TestExplainIntegration:
         torch.manual_seed(42)
         sd = {
             "layers.0.mlp.down_proj.weight": torch.randn(64, 256),
-            "final_norm.weight": torch.full((64,), 2.5),
+            "final_norm.weight": torch.full((64,), 15.0),
             "wrapper/gate": torch.tensor(-10.0),
             "bad_param": torch.randn(32, 32),
         }

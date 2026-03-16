@@ -38,7 +38,7 @@ class TestAutopsyAPI:
         sd = {
             "bad_param": torch.randn(32, 32),
             "exploding.weight": torch.randn(64, 64) * 200,
-            "final_norm.weight": torch.full((64,), 5.0),
+            "final_norm.weight": torch.full((64,), 15.0),
         }
         sd["bad_param"][5, 5] = float("nan")
         result = autopsy(sd, score_threshold=50)
@@ -124,8 +124,8 @@ class TestAutopsyAPI:
         """A model with only norm_drift should be auto-fixable."""
         from model_clinic._tools.autopsy import autopsy
 
-        # norm_drift threshold is |mean - 1.0| > 1.5, so mean > 2.5
-        sd = {"layers.0.norm.weight": torch.full((64,), 3.0)}
+        # norm_drift threshold is |mean - 1.0| > 3.0, so mean > 4.0
+        sd = {"layers.0.norm.weight": torch.full((64,), 15.0)}
         result = autopsy(sd, score_threshold=101)
         assert result["redirect"] is False
         # norm_drift is in _AUTO_FIXABLE
@@ -271,7 +271,7 @@ class TestAutopsyCLI:
         sd = {
             "bad_param": torch.randn(32, 32),
             "exploding.weight": torch.randn(64, 64) * 200,
-            "final_norm.weight": torch.full((64,), 5.0),
+            "final_norm.weight": torch.full((64,), 15.0),
         }
         sd["bad_param"][5, 5] = float("nan")
         path = tmp_path / "sick.pt"
