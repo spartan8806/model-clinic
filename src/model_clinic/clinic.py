@@ -2178,6 +2178,11 @@ def run_treat(args):
     # Diagnose
     findings = diagnose(state_dict, meta_dict, verbose=verbose)
 
+    # Snapshot static findings for the before/after health comparison. Runtime
+    # findings are excluded so the health delta is apples-to-apples (the after
+    # re-diagnosis is static-only — no model reload).
+    static_findings_before = list(findings)
+
     runtime_prompts = EXAMPLE_RUNTIME_PROMPTS if getattr(args, "example_prompts", False) else None
     if args.runtime:
         try:
@@ -2203,7 +2208,10 @@ def run_treat(args):
         return
 
     # Before test
-    before_score = before_ppl = None
+    before_score = before_ppl = before_total = None
+    after_score = after_ppl = after_total = None
+    rolled_back = False
+    rollback_reason = ""
     if getattr(args, "test", False):
         if not args.quiet:
             print(f"\n{'='*80}")
@@ -2211,7 +2219,8 @@ def run_treat(args):
             print(f"{'='*80}")
         try:
             model, tokenizer, device = load_model(args.model, hf=args.hf)
-            before_score, total, results = eval_coherence(model, tokenizer, device)
+            before_score, before_total, results = eval_coherence(model, tokenizer, device)
+            total = before_total
             before_ppl = eval_perplexity(model, tokenizer, device)
             if not args.quiet:
                 print(f"  Coherent: {before_score}/{total}, PPL: {before_ppl}")
@@ -2264,27 +2273,27 @@ def run_treat(args):
             model, tokenizer, device = load_model(args.model, hf=args.hf)
             if args.hf:
                 model.load_state_dict(state_dict)
-            after_score, total, results = eval_coherence(model, tokenizer, device)
+            after_score, after_total, results = eval_coherence(model, tokenizer, device)
             after_ppl = eval_perplexity(model, tokenizer, device)
             if not args.quiet:
-                print(f"  Coherent: {after_score}/{total} (was {before_score}/{total})")
+                print(f"  Coherent: {after_score}/{after_total} (was {before_score}/{before_total})")
                 print(f"  PPL: {after_ppl} (was {before_ppl})")
                 for r in results:
                     tag = "OK" if r["coherent"] else "BAD"
                     print(f"    [{tag}] {r['prompt']}")
                     print(f"         {safe_str(r['response'][:120])}")
 
-            # Auto-rollback
+            # Auto-rollback on measured regression (strongest signal)
             if not getattr(args, "no_rollback", False):
                 if before_score is not None and after_score < before_score:
-                    if not args.quiet:
-                        print(f"\n  ROLLING BACK: generation regressed ({before_score} -> {after_score})")
-                    for result in reversed(applied):
-                        rollback_treatment(state_dict, result)
-                    applied = []
+                    rolled_back = True
+                    rollback_reason = f"generation regressed ({before_score} -> {after_score})"
                 elif before_ppl is not None and after_ppl > before_ppl * 1.2:
+                    rolled_back = True
+                    rollback_reason = f"PPL regressed ({before_ppl} -> {after_ppl})"
+                if rolled_back:
                     if not args.quiet:
-                        print(f"\n  ROLLING BACK: PPL regressed ({before_ppl} -> {after_ppl})")
+                        print(f"\n  ROLLING BACK: {rollback_reason}")
                     for result in reversed(applied):
                         rollback_treatment(state_dict, result)
                     applied = []
@@ -2293,6 +2302,46 @@ def run_treat(args):
         except Exception as e:
             if not args.quiet:
                 print(f"  Post-treatment testing skipped: {e}")
+
+    # ── Validation: recompute health on the final state ───────────────────
+    # The health-score delta is pure static analysis — it works on every
+    # checkpoint with no model reload, so it runs even without --test.
+    health_before = compute_health_score(static_findings_before)
+    health_after = None
+    if not dry_run:
+        health_after = compute_health_score(diagnose(state_dict, meta_dict))
+
+        # Static-only rollback: when no runtime test was run, protect against a
+        # treatment that worsened the static health score. (When --test ran, the
+        # measured-regression rollback above already had final say.)
+        if (after_score is None and not rolled_back
+                and not getattr(args, "no_rollback", False)
+                and applied and health_after.overall < health_before.overall):
+            rolled_back = True
+            rollback_reason = (f"health regressed "
+                               f"({health_before.overall} -> {health_after.overall})")
+            if not args.quiet:
+                print(f"\n  ROLLING BACK: {rollback_reason}")
+            for result in reversed(applied):
+                rollback_treatment(state_dict, result)
+            applied = []
+            health_after = compute_health_score(diagnose(state_dict, meta_dict))
+
+    if not args.quiet and not dry_run:
+        from model_clinic._validation import ValidationReport, print_validation_report
+        report = ValidationReport(
+            n_applied=len(applied),
+            n_total=len(prescriptions),
+            health_before=health_before,
+            health_after=health_after,
+            ppl_before=before_ppl,
+            ppl_after=after_ppl,
+            coherence_before=(before_score, before_total) if before_score is not None else None,
+            coherence_after=(after_score, after_total) if after_score is not None else None,
+            rolled_back=rolled_back,
+            rollback_reason=rollback_reason,
+        )
+        print_validation_report(report)
 
     # Save
     if getattr(args, "save", None) and not dry_run and applied:
@@ -2318,7 +2367,7 @@ def run_treat(args):
     if args.export:
         report = ExamReport(args.model, meta, findings, prescriptions,
                             [r for r in applied],
-                            before_score, before_ppl)
+                            before_score, before_ppl, after_score, after_ppl)
         with open(args.export, "w") as f:
             json.dump(report.to_dict(), f, indent=2, default=str)
         if not args.quiet:

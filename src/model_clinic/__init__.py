@@ -1,12 +1,13 @@
 """model-clinic: Diagnose, treat, and understand neural network models."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.2"
 
 from model_clinic._types import (
     Finding, Prescription, TreatmentResult, ExamReport, ModelMeta, HealthScore,
     ExamResult, PipelineResult, MonitorAlert, MonitorSummary,
 )
 from model_clinic._health_score import compute_health_score, print_health_score
+from model_clinic._validation import ValidationReport, print_validation_report
 from model_clinic._monitor import ClinicMonitor
 from model_clinic._hf_callback import ClinicTrainerCallback
 from model_clinic._integrations import (
@@ -70,6 +71,9 @@ __all__ = [
     # Health score
     "compute_health_score",
     "print_health_score",
+    # Validation
+    "ValidationReport",
+    "print_validation_report",
     # Loader
     "load_state_dict",
     "load_model",

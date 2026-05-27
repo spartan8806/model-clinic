@@ -50,10 +50,10 @@ model-clinic exam checkpoint.pt --hf --runtime --example-prompts
 # Verbose output (show each detector as it runs)
 model-clinic exam checkpoint.pt --verbose
 
-# Treat and save
+# Treat and save (prints a before/after health validation report)
 model-clinic treat checkpoint.pt --save treated.pt
 
-# Treat with before/after generation testing
+# Treat with before/after generation testing (adds PPL + coherence to the report)
 model-clinic treat checkpoint.pt --test --save treated.pt
 
 # Only safe fixes
@@ -132,6 +132,37 @@ $ model-clinic treat my_model.pt --conservative --save treated.pt
   Applied: 2/4 (conservative mode: 2 skipped)
   Saved treated model to treated.pt
 ```
+
+### Treatment validation
+
+Every `treat` ends with a before/after report so you can see what the treatment
+actually did — not just that it ran. The health-score delta is pure static
+analysis (no GPU, no `--test` needed); perplexity and coherence are added when
+you pass `--test`.
+
+```
+$ model-clinic treat broken.pt --save treated.pt
+
+  ... fixes applied ...
+
+================================================================================
+TREATMENT VALIDATION
+================================================================================
+  Applied 14/14 fixes.
+
+  Metric        Before        After         Change
+  ------------  ------------  ------------  ----------------
+  Health        34/F          59/D          +25 ▲
+  PPL           11726.0       46.6          251.6x better ▲    (with --test)
+  Coherence     0.40          0.80          +0.40 ▲            (with --test)
+
+  VERDICT: IMPROVED — treatment helped on measured metrics.
+================================================================================
+```
+
+If a treatment makes things worse, it auto-rolls-back: measured regression
+(PPL/coherence) when `--test` is on, or a drop in the static health score
+otherwise. Disable with `--no-rollback`.
 
 ### Validate
 

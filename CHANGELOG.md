@@ -7,6 +7,40 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.2] - 2026-05-26
+
+### Added
+
+**Treatment validation loop**
+
+`treat` now reports what a treatment actually did, not just that it ran.
+
+- New `ValidationReport` type and `print_validation_report()` (`_validation.py`),
+  exported from the public API.
+- Every `treat` now prints a before/after table with a verdict
+  (`IMPROVED` / `REGRESSED` / `NEUTRAL` / `ROLLED BACK`).
+- **Health-score delta is pure static analysis** — it runs on every checkpoint
+  with no GPU, tokenizer, or `--test` required (re-diagnoses the treated state
+  dict). PPL and coherence deltas are added automatically when `--test` is used.
+- Self-protecting: static-only runs now auto-roll-back if a treatment *lowers*
+  the health score; when `--test` is on, measured PPL/coherence regression keeps
+  final say (runtime evidence outranks the static score).
+- `--export` JSON now includes after-treatment PPL and coherence.
+
+### Fixed
+
+- `__version__` was stale at `0.3.0`; now tracks the package version.
+- Validation output is ASCII-safe (falls back from unicode arrows / em-dashes on
+  cp1252 consoles) so `treat` cannot crash on Windows terminals.
+
+## [0.4.1] - 2026-03-16
+
+### Changed
+
+- **Threshold calibration.** Recalibrated detector thresholds against real
+  Qwen2.5-0.5B-Instruct weights to eliminate false positives. The base model
+  now scores 96/A (was 49/F under the old, over-sensitive thresholds).
+
 ## [0.4.0] - 2026-03-13
 
 ### Added
