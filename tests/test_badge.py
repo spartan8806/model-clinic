@@ -297,9 +297,11 @@ class TestGenerateModelCardSnippet:
         assert snippet.startswith("## Model Health")
 
     def test_contains_version(self):
+        import model_clinic
         health, findings = self._score_and_findings()
         snippet = generate_model_card_snippet(health, findings)
-        assert "v0.3.0" in snippet
+        # Must reflect the live package version, not a frozen literal.
+        assert f"v{model_clinic.__version__}" in snippet
 
 
 # ── Color mapping correctness ─────────────────────────────────────────────────

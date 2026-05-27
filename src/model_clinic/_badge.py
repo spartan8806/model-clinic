@@ -4,8 +4,6 @@ from urllib.parse import quote
 
 from model_clinic._types import HealthScore
 
-__version__ = "0.3.0"
-
 # ── Color mapping ────────────────────────────────────────────────────────────
 
 GRADE_COLORS = {
@@ -147,8 +145,9 @@ def generate_model_card_snippet(
             lines.append(f"- `{f.severity}` {f.condition} — `{f.param_name}`")
         lines.append("")
 
+    from model_clinic import __version__ as _mc_version  # single source of truth
     lines.append(
-        f"*Analyzed with [model-clinic](https://pypi.org/project/model-clinic/) v{__version__}*"
+        f"*Analyzed with [model-clinic](https://pypi.org/project/model-clinic/) v{_mc_version}*"
     )
     lines.append("")
 

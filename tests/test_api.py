@@ -7,8 +7,24 @@ class TestPublicAPI:
     """Verify all documented symbols are importable."""
 
     def test_version(self):
+        import re
+        import pathlib
         import model_clinic
-        assert model_clinic.__version__ == "0.3.0"
+        # __version__ must track the declared version, not a hardcoded literal,
+        # so it can't silently drift across releases (it did: it was frozen at
+        # "0.3.0" through the 0.4.0 and 0.4.1 releases).
+        v = model_clinic.__version__
+        assert isinstance(v, str)
+        parts = v.split(".")
+        assert len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit()
+        # Compare against pyproject.toml — the true source of truth — rather than
+        # install metadata, which lags behind in editable installs.
+        pyproject = pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
+        if pyproject.exists():
+            text = pyproject.read_text(encoding="utf-8")
+            m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+            assert m, "version not found in pyproject.toml"
+            assert v == m.group(1), f"__version__ {v} != pyproject {m.group(1)}"
 
     def test_types_importable(self):
         from model_clinic import Finding, Prescription, TreatmentResult, ExamReport, ModelMeta
